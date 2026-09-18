@@ -22,11 +22,13 @@
 #define SHARE_JEANDLE_READ_ELF_HPP
 
 #include "jeandle/__llvmHeadersBegin__.hpp"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Object/ELFObjectFile.h"
 #include "llvm/Support/MemoryBuffer.h"
 
 #include "jeandle/__hotspotHeadersBegin__.hpp"
 #include "memory/allStatic.hpp"
+#include "jeandle/jeandleConstSectionPlan.hpp"
 
 using ELFT = llvm::object::ELF64LE;
 using ELFObject = llvm::object::ELFObjectFile<ELFT>;
@@ -50,6 +52,19 @@ class ReadELF : public AllStatic {
 
   static bool findSection(ELFObject& elf,
                           SectionInfo& section_info);
+
+  static bool is_jeandle_const_section(llvm::StringRef name) {
+    return name == ".rodata" ||
+           name.starts_with(".rodata.") ||
+           name == ".data.rel.ro" ||
+           name.starts_with(".data.rel.ro.");
+  }
+
+  static void collect_const_sections(ELFObject& elf,
+                                     llvm::SmallVectorImpl<SectionInfo>& const_sections);
+
+  static bool build_const_section_plan(ELFObject& elf,
+                                       ConstSectionPlan& plan);
 };
 
 #endif // SHARE_JEANDLE_READ_ELF_HPP

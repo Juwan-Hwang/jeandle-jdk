@@ -190,7 +190,10 @@ class JeandleCompiledCode : public StackObj {
                       _code_buffer("JeandleCompiledCode"),
                       _routine_call_sites(),
                       _non_routine_call_sites(),
+                      _const_section_addrs_by_index(),
                       _const_sections(),
+                      _const_plan(),
+                      _used_const_layout_fallback(false),
                       _oop_handles(),
                       _oop_handle_ids(),
                       _oop_handle_info(),
@@ -215,7 +218,10 @@ class JeandleCompiledCode : public StackObj {
                       _code_buffer("JeandleCompiledStub"),
                       _routine_call_sites(),
                       _non_routine_call_sites(),
+                      _const_section_addrs_by_index(),
                       _const_sections(),
+                      _const_plan(),
+                      _used_const_layout_fallback(false),
                       _oop_handles(),
                       _oop_handle_ids(),
                       _oop_handle_info(),
@@ -232,6 +238,8 @@ class JeandleCompiledCode : public StackObj {
                       _orig_pc_offset_in_bytes(-1),
                       _interpreter_frame_size_in_bytes(0),
                       _has_method_handle_invoke(false) {}
+
+  const ConstSectionPlan& const_plan() const { return _const_plan; }
 
   void install_obj(std::unique_ptr<ObjectBuffer> obj);
 
@@ -311,7 +319,10 @@ class JeandleCompiledCode : public StackObj {
   llvm::SmallVector<CallSiteInfo*> _non_routine_call_sites; // Contains all other call sites,
                                                             // constructed during LLVM IR generation.
 
+  llvm::DenseMap<uint32_t, address> _const_section_addrs_by_index;
   llvm::StringMap<address> _const_sections;
+  ConstSectionPlan _const_plan;
+  bool _used_const_layout_fallback;
 
   // Oop handles maintainer:
   llvm::StringMap<jobject> _oop_handles;                // name -> jobject
@@ -340,8 +351,13 @@ class JeandleCompiledCode : public StackObj {
                         llvm::SmallVector<JeandleReloc*>& relocs,
                         llvm::jitlink::LinkGraph* link_graph);
 
-  // Lookup address of const section in CodeBuffer.
+  // Week 4: Centralized emission of planned const sections.
+  void emit_planned_const_sections(JeandleAssembler& assembler);
+
+  // Lookup address of const section in CodeBuffer (index is canonical primary identity).
+  address lookup_const_section(uint32_t section_index, JeandleAssembler& assembler);
   address lookup_const_section(llvm::StringRef name, JeandleAssembler& assembler);
+  address lookup_const_section_fallback(llvm::StringRef name, JeandleAssembler& assembler);
   address resolve_const_reloc_site(LinkBlock& block, LinkEdge& edge, JeandleAssembler& assembler);
   address resolve_const_edge(LinkBlock& block, LinkEdge& edge, JeandleAssembler& assembler);
 

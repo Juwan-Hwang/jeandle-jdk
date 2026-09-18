@@ -121,6 +121,10 @@ void CodeBuffer::initialize(csize_t code_size, csize_t locs_size) {
     _insts.initialize_locs(locs_size / sizeof(relocInfo));
   }
 
+  if (JeandleCodeBufferInstrument) {
+    CodeBufferInstrumentation::instance()->record_initialize(_name, code_size, 0, 0, locs_size);
+  }
+
   debug_only(verify_section_allocation();)
 }
 
@@ -134,6 +138,10 @@ void CodeBuffer::initialize(csize_t inst_size,
   }
   initialize_section_size(&_stubs, stubs_size);
   initialize_oop_recorder(oop_recorder);
+
+  if (JeandleCodeBufferInstrument) {
+    CodeBufferInstrumentation::instance()->record_initialize(_name, inst_size, 0, stubs_size, locs_size);
+  }
 }
 
 CodeBuffer::~CodeBuffer() {
@@ -870,6 +878,8 @@ csize_t CodeBuffer::figure_expanded_capacities(CodeSection* which_cs,
 }
 
 void CodeBuffer::expand(CodeSection* which_cs, csize_t amount) {
+  CodeBufferTimer expand_timer;
+
 #ifndef PRODUCT
   if (PrintNMethods && (WizardMode || Verbose)) {
     tty->print("expanding CodeBuffer:");
@@ -897,6 +907,11 @@ void CodeBuffer::expand(CodeSection* which_cs, csize_t amount) {
   memset(new_capacity, 0, sizeof(csize_t) * SECT_LIMIT);
   csize_t new_total_cap
     = figure_expanded_capacities(which_cs, amount, new_capacity);
+
+  if (JeandleCodeBufferInstrument) {
+    int sect = (int)(which_cs - &_consts);
+    CodeBufferInstrumentation::instance()->record_expand(sect, amount, new_total_cap, expand_timer.elapsed_us());
+  }
 
   // Create a new (temporary) code buffer to hold all the new data
   CodeBuffer cb(name(), new_total_cap, 0);

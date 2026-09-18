@@ -35,6 +35,7 @@
 
 #include "jeandle/__hotspotHeadersBegin__.hpp"
 #include "asm/macroAssembler.hpp"
+#include "asm/codeBufferInstrumentation.hpp"
 #include "ci/ciEnv.hpp"
 #include "ci/ciInstanceKlass.hpp"
 #include "ci/ciUtilities.inline.hpp"
@@ -178,6 +179,22 @@ void JeandleCompiledCode::finalize() {
   bool found = ReadELF::findFunc(*_elf, _func_name, align, offset, code_size);
   JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(found, "compiled function is not found in the ELF file");
 
+  // Week 3: Build ConstSectionPlan for deterministic layout modeling and prediction
+  bool plan_ok = ReadELF::build_const_section_plan(*_elf, _const_plan);
+  if (JeandleCodeBufferInstrument && plan_ok) {
+    tty->print_cr("[JeandleConstPlan] Method: %s, entries: %zu, planned_total_size: %llu, max_align: %llu",
+                  _func_name.c_str(), _const_plan.entry_count(),
+                  (unsigned long long)_const_plan.total_size(),
+                  (unsigned long long)_const_plan.max_alignment());
+    for (const auto& entry : _const_plan.entries()) {
+      tty->print_cr("  [PlanEntry] idx=%u, name=%s, size=%llu, align=%llu, planned_offset=%llu",
+                    entry._section_index, entry._section_name.c_str(),
+                    (unsigned long long)entry._size,
+                    (unsigned long long)entry._alignment,
+                    (unsigned long long)entry._consts_offset);
+    }
+  }
+
   setup_frame_size();
   RETURN_VOID_ON_JEANDLE_ERROR();
   assert(_frame_size > 0, "frame size must be positive");
@@ -194,6 +211,12 @@ void JeandleCompiledCode::finalize() {
     JEANDLE_REPORT_ERROR_AND_RET_VOID("CodeCache is full");
   }
   _code_buffer.initialize_consts_size(consts_size);
+
+  // Update instrumentation with consts_size
+  if (JeandleCodeBufferInstrument) {
+    CodeBufferInstrumentation::instance()->record_initialize(
+      _code_buffer.name(), code_size, (int)consts_size, 160, sizeof(relocInfo) + relocInfo::length_limit);
+  }
 
   // Initialize assembler.
   MacroAssembler* masm = new MacroAssembler(&_code_buffer);
@@ -248,12 +271,33 @@ void JeandleCompiledCode::finalize() {
 
   assembler.emit_insts(((address) _obj->getBufferStart()) + offset, code_size);
 
+  // Week 4: Emit planned const sections in canonical order before resolving relocations
+  emit_planned_const_sections(assembler);
+
   resolve_reloc_info(assembler);
   RETURN_VOID_ON_JEANDLE_ERROR();
 
   // generate shared trampoline stubs
   if (!_code_buffer.finalize_stubs()) {
     JEANDLE_REPORT_ERROR_AND_RET_VOID("shared stub overflow");
+  }
+
+  if (JeandleCodeBufferInstrument) {
+    CodeBufferInstrumentation::instance()->record_finalize(
+      _code_buffer.consts()->size(),
+      _code_buffer.consts()->capacity(),
+      _code_buffer.insts()->size(),
+      _code_buffer.stubs()->size(),
+      0);  // TODO: add finalize timer
+
+    if (_const_plan.is_valid()) {
+      uint64_t actual_used = (uint64_t)_code_buffer.consts()->size();
+      tty->print_cr("[JeandleConstTotal] Method: %s, planned_total_size: %llu, actual_used_extent: %llu, diff: %lld",
+                    _func_name.c_str(),
+                    (unsigned long long)_const_plan.total_size(),
+                    (unsigned long long)actual_used,
+                    (long long)(actual_used - _const_plan.total_size()));
+    }
   }
 
   if (_entry_barrier_stub != nullptr) {
@@ -438,24 +482,104 @@ void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler) {
   }
 }
 
-address JeandleCompiledCode::lookup_const_section(llvm::StringRef name, JeandleAssembler& assembler) {
-  auto it = _const_sections.find(name);
-  if (it == _const_sections.end()) {
-    // Copy to CodeBuffer if const section is not found.
-    SectionInfo section_info(name);
-    bool found = ReadELF::findSection(*_elf, section_info);
-    JEANDLE_ERROR_ASSERT_AND_RET_ON_FAIL(found, "const section not found, bad ELF file", nullptr);
-
-    address target_base = _code_buffer.consts()->end();
-    int padding = assembler.emit_consts(((address) _obj->getBufferStart()) + section_info._offset,
-                                         section_info._size,
-                                         section_info._alignment);
-    target_base += padding;
-    _const_sections.insert({name, target_base});
-    return target_base;
+void JeandleCompiledCode::emit_planned_const_sections(JeandleAssembler& assembler) {
+  if (!_const_plan.is_valid() || _const_plan.is_empty()) {
+    return;
   }
 
-  return it->getValue();
+  address consts_start = _code_buffer.consts()->start();
+  JeandleCompilation::current()->set_const_section_alignment((int)_const_plan.max_alignment());
+
+  for (const auto& entry : _const_plan.entries()) {
+    // Direct zero-parsing retrieval using plan entry properties (Fix 2)
+    address src = ((address)_obj->getBufferStart()) + entry._elf_offset;
+    address expected_base = consts_start + entry._consts_offset;
+    address current_end = _code_buffer.consts()->end();
+    assert(current_end <= expected_base, "consts buffer overlap or layout inversion");
+
+    if (expected_base > current_end) {
+      _code_buffer.consts()->set_end(expected_base);
+    }
+
+    // Direct memory copy to planned location (Fix 5)
+    memcpy(expected_base, src, (size_t)entry._size);
+    _code_buffer.consts()->set_end(expected_base + entry._size);
+
+    // Primary identity indexing (Fix 1)
+    _const_section_addrs_by_index.insert({entry._section_index, expected_base});
+    _const_sections.insert({entry._section_name, expected_base});
+
+    if (JeandleCodeBufferInstrument) {
+      tty->print_cr("[JeandlePlannedEmit] Method: %s, Section: %s, idx=%u, offset=%llu, size=%llu, base=" PTR_FORMAT,
+                    _func_name.c_str(), entry._section_name.c_str(), entry._section_index,
+                    (unsigned long long)entry._consts_offset,
+                    (unsigned long long)entry._size,
+                    p2i(expected_base));
+    }
+  }
+
+  // Strict assert decoupled from fallback (Fix 3)
+  if (!_used_const_layout_fallback) {
+    assert(_code_buffer.consts()->size() == (int)_const_plan.total_size(),
+           "emitted consts size must strictly match planned total size");
+  }
+}
+
+address JeandleCompiledCode::lookup_const_section(uint32_t section_index, JeandleAssembler& assembler) {
+  // Primary lookup by ELF section index (canonical identity)
+  auto it = _const_section_addrs_by_index.find(section_index);
+  if (it != _const_section_addrs_by_index.end()) {
+    return it->second;
+  }
+
+  const auto* entry = _const_plan.find_by_index(section_index);
+  if (entry != nullptr) {
+    auto it_name = _const_sections.find(entry->_section_name);
+    if (it_name != _const_sections.end()) {
+      _const_section_addrs_by_index.insert({section_index, it_name->getValue()});
+      return it_name->getValue();
+    }
+    return lookup_const_section_fallback(entry->_section_name, assembler);
+  }
+
+  return nullptr;
+}
+
+address JeandleCompiledCode::lookup_const_section(llvm::StringRef name, JeandleAssembler& assembler) {
+  // Resolve name to canonical index if present in plan
+  const auto* entry = _const_plan.find_by_name(name.str());
+  if (entry != nullptr) {
+    return lookup_const_section(entry->_section_index, assembler);
+  }
+
+  // Check name cache
+  auto it = _const_sections.find(name);
+  if (it != _const_sections.end()) {
+    return it->getValue();
+  }
+
+  // Fallback for unpredicted / unexpected sections
+  return lookup_const_section_fallback(name, assembler);
+}
+
+address JeandleCompiledCode::lookup_const_section_fallback(llvm::StringRef name, JeandleAssembler& assembler) {
+  _used_const_layout_fallback = true;
+
+  if (JeandleCodeBufferInstrument) {
+    tty->print_cr("[JeandleFallback] Const section %s fell back to dynamic discovery/append!", name.str().c_str());
+  }
+
+  SectionInfo section_info(name);
+  bool found = ReadELF::findSection(*_elf, section_info);
+  JEANDLE_ERROR_ASSERT_AND_RET_ON_FAIL(found, "const section not found, bad ELF file", nullptr);
+
+  address target_base = _code_buffer.consts()->end();
+  int padding = assembler.emit_consts(((address) _obj->getBufferStart()) + section_info._offset,
+                                       section_info._size,
+                                       section_info._alignment);
+  target_base += padding;
+  _const_sections.insert({name, target_base});
+  return target_base;
 }
 
 address JeandleCompiledCode::resolve_const_reloc_site(LinkBlock& block, LinkEdge& edge, JeandleAssembler& assembler) {
@@ -467,6 +591,19 @@ address JeandleCompiledCode::resolve_const_reloc_site(LinkBlock& block, LinkEdge
   if (section_base == nullptr) {
     return nullptr;
   }
+
+#ifdef ASSERT
+  if (_const_plan.is_valid() && !_used_const_layout_fallback) {
+    address consts_begin = _code_buffer.consts()->start();
+    assert(section_base >= consts_begin, "const section base must be inside consts section");
+    const auto* entry = _const_plan.find_by_name(section_name.str());
+    if (entry != nullptr) {
+      assert(entry->_consts_offset <= _const_plan.total_size(), "entry offset overflow");
+      assert(entry->_size <= _const_plan.total_size() - entry->_consts_offset, "entry size overflow");
+      assert(section_base == consts_begin + entry->_consts_offset, "const section base does not match planned offset");
+    }
+  }
+#endif
 
   llvm::jitlink::SectionRange range(block.getSection());
   uint64_t offset_in_section = block.getAddress() - range.getFirstBlock()->getAddress();
@@ -482,6 +619,19 @@ address JeandleCompiledCode::resolve_const_edge(LinkBlock& block, LinkEdge& edge
   if (target_base == nullptr) {
     return nullptr;
   }
+
+#ifdef ASSERT
+  if (_const_plan.is_valid() && !_used_const_layout_fallback) {
+    address consts_begin = _code_buffer.consts()->start();
+    assert(target_base >= consts_begin, "const section base must be inside consts section");
+    const auto* entry = _const_plan.find_by_name(target_name.str());
+    if (entry != nullptr) {
+      assert(entry->_consts_offset <= _const_plan.total_size(), "entry offset overflow");
+      assert(entry->_size <= _const_plan.total_size() - entry->_consts_offset, "entry size overflow");
+      assert(target_base == consts_begin + entry->_consts_offset, "const section base does not match planned offset");
+    }
+  }
+#endif
 
   llvm::jitlink::SectionRange range(target_section);
   uint64_t offset_in_section = target.getAddress() - range.getFirstBlock()->getAddress();
