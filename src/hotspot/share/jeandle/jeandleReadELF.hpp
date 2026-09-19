@@ -63,8 +63,17 @@ class ReadELF : public AllStatic {
   static void collect_const_sections(ELFObject& elf,
                                      llvm::SmallVectorImpl<SectionInfo>& const_sections);
 
+  // Week 5 (F2): every llvm::Expected is checked, so a malformed ELF makes the
+  // planner fail (and the caller fall back) instead of aborting the VM via
+  // Expected::value().
+  //
+  // consts_base_alignment is forwarded to the planner so that a section whose
+  // alignment the CodeBuffer cannot guarantee for the consts base is rejected
+  // rather than silently emitted at a misaligned address.
   static bool build_const_section_plan(ELFObject& elf,
-                                       ConstSectionPlan& plan);
+                                       ConstSectionPlan& plan,
+                                       uint64_t consts_base_alignment =
+                                         ConstSectionPlan::MAX_SUPPORTED_CONST_ALIGNMENT);
 };
 
 #endif // SHARE_JEANDLE_READ_ELF_HPP

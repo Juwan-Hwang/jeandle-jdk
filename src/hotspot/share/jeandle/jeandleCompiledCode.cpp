@@ -171,7 +171,37 @@ void JeandleCompiledCode::install_obj(std::unique_ptr<ObjectBuffer> obj) {
     "expected exactly one compiled function in ELF, but found multiple");
 }
 
+// Week 5: RAII telemetry guard.
+//
+// finalize() has several RETURN_VOID_ON_JEANDLE_ERROR() exits. Writing the
+// record only on the success path silently dropped every failed compilation
+// from the statistics, and - combined with a hard-coded latency of 0 - is how
+// the instrumented "Total finalize latency" stayed at 0 through Week 4. A
+// destructor-based guard records once per invocation regardless of exit path.
+class FinalizeTelemetry : public StackObj {
+ private:
+  JeandleCompiledCode* _cc;
+  CodeBufferTimer _timer;
+  bool _recorded;
+
+ public:
+  FinalizeTelemetry(JeandleCompiledCode* cc) : _cc(cc), _recorded(false) {}
+  ~FinalizeTelemetry() {
+    if (!_recorded) {
+      record();
+    }
+  }
+  void record() {
+    assert(!_recorded, "recorded twice");
+    _recorded = true;
+    _cc->record_finalize_telemetry(_timer.elapsed_us());
+  }
+};
+
 void JeandleCompiledCode::finalize() {
+  // Records CodeBuffer telemetry exactly once, whatever the exit path is.
+  FinalizeTelemetry finalize_telemetry(this);
+
   // Set up code buffer.
   uint64_t align;
   uint64_t offset;
@@ -179,43 +209,29 @@ void JeandleCompiledCode::finalize() {
   bool found = ReadELF::findFunc(*_elf, _func_name, align, offset, code_size);
   JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(found, "compiled function is not found in the ELF file");
 
-  // Week 3: Build ConstSectionPlan for deterministic layout modeling and prediction
-  bool plan_ok = ReadELF::build_const_section_plan(*_elf, _const_plan);
-  if (JeandleCodeBufferInstrument && plan_ok) {
-    tty->print_cr("[JeandleConstPlan] Method: %s, entries: %zu, planned_total_size: %llu, max_align: %llu",
-                  _func_name.c_str(), _const_plan.entry_count(),
-                  (unsigned long long)_const_plan.total_size(),
-                  (unsigned long long)_const_plan.max_alignment());
-    for (const auto& entry : _const_plan.entries()) {
-      tty->print_cr("  [PlanEntry] idx=%u, name=%s, size=%llu, align=%llu, planned_offset=%llu",
-                    entry._section_index, entry._section_name.c_str(),
-                    (unsigned long long)entry._size,
-                    (unsigned long long)entry._alignment,
-                    (unsigned long long)entry._consts_offset);
-    }
-  }
-
   setup_frame_size();
   RETURN_VOID_ON_JEANDLE_ERROR();
   assert(_frame_size > 0, "frame size must be positive");
 
-  // An estimated initial value.
-  uint64_t consts_size = 6144 * wordSize;
+  // Week 5 (F4): decide the whole allocation strategy here, while the CodeBuffer
+  // still has no section sizes. Nothing below may change consts capacity or
+  // consts alignment again.
+  InstallLayoutCore layout;
+  decide_install_layout(code_size, layout);
 
-  // TODO: How to figure out memory usage.
-  _code_buffer.initialize(code_size + consts_size + 2048/* for prolog */,
-                          sizeof(relocInfo) + relocInfo::length_limit,
-                          160,
+  _code_buffer.initialize(layout.code_size_input,
+                          layout.locs_payload,
+                          layout.stubs_payload,
                           _env->oop_recorder());
   if (_code_buffer.blob() == nullptr) {
     JEANDLE_REPORT_ERROR_AND_RET_VOID("CodeCache is full");
   }
-  _code_buffer.initialize_consts_size(consts_size);
+  _code_buffer.initialize_consts_size(layout.consts_payload);
 
-  // Update instrumentation with consts_size
   if (JeandleCodeBufferInstrument) {
     CodeBufferInstrumentation::instance()->record_initialize(
-      _code_buffer.name(), code_size, (int)consts_size, 160, sizeof(relocInfo) + relocInfo::length_limit);
+      _code_buffer.name(), (int)layout.code_size_input, (int)layout.consts_payload,
+      (int)layout.stubs_payload, (int)layout.locs_payload);
   }
 
   // Initialize assembler.
@@ -282,23 +298,7 @@ void JeandleCompiledCode::finalize() {
     JEANDLE_REPORT_ERROR_AND_RET_VOID("shared stub overflow");
   }
 
-  if (JeandleCodeBufferInstrument) {
-    CodeBufferInstrumentation::instance()->record_finalize(
-      _code_buffer.consts()->size(),
-      _code_buffer.consts()->capacity(),
-      _code_buffer.insts()->size(),
-      _code_buffer.stubs()->size(),
-      0);  // TODO: add finalize timer
-
-    if (_const_plan.is_valid()) {
-      uint64_t actual_used = (uint64_t)_code_buffer.consts()->size();
-      tty->print_cr("[JeandleConstTotal] Method: %s, planned_total_size: %llu, actual_used_extent: %llu, diff: %lld",
-                    _func_name.c_str(),
-                    (unsigned long long)_const_plan.total_size(),
-                    (unsigned long long)actual_used,
-                    (long long)(actual_used - _const_plan.total_size()));
-    }
-  }
+  finalize_telemetry.record();
 
   if (_entry_barrier_stub != nullptr) {
     _entry_barrier_stub->emit(masm);
@@ -482,13 +482,186 @@ void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Week 5: allocation strategy decision
+//
+// Why this must run before CodeBuffer::initialize()
+// -------------------------------------------------
+// CodeBuffer fixes three things at initialize() time, and none of them can be
+// changed afterwards:
+//
+//   1. _const_section_alignment is read in initialize() to size the BufferBlob
+//      (total_size includes _consts.alignment()).
+//   2. initialize_section_size(&_consts, size) picks the consts division point
+//      as `limit - size` rounded DOWN to _const_section_alignment. That rounding
+//      is what actually aligns consts base.
+//   3. consts capacity itself.
+//
+// Week 1-4 set the consts alignment inside emit_planned_const_sections(), i.e.
+// after all three had already happened, so consts base was only ever aligned to
+// sizeof(jdouble). The Week 4 data confirms it: a 16-byte-aligned .rodata was
+// emitted at 0x...c98c2578, which is not 16-byte aligned.
+//
+// Everything allocation-relevant therefore has to be decided here, up front.
+void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
+                                                InstallLayoutCore& layout) {
+  // Start from the pre-Week-5 values so every field is defined even if we bail
+  // out early, and so the legacy path stays bit-for-bit identical.
+  layout.insts_payload        = (size_t)elf_text_size + INSTS_PROLOG_RESERVE;
+  layout.stubs_payload        = LEGACY_STUBS_SIZE;
+  layout.locs_payload         = sizeof(relocInfo) + relocInfo::length_limit;
+  layout.consts_payload       = LEGACY_CONSTS_SIZE;
+  layout.used_legacy_fallback = true;
+  layout.plan_status          = "legacy";
+
+  ConstLayoutStats::record_method();
+
+  bool plan_ok = ReadELF::build_const_section_plan(*_elf, _const_plan, CodeEntryAlignment);
+  layout.plan_status = ConstSectionPlan::status_name(_const_plan.status());
+
+  if (!plan_ok) {
+    // Planner refused. Every refusal has a documented reason in
+    // _const_plan.status(); fall back to the strategy that has worked so far.
+    ConstLayoutStats::record_plan_failure();
+    ConstLayoutStats::record_legacy(layout.consts_payload);
+    _plan_status = layout.plan_status;
+    _planned_consts_size = -1;
+    _used_exact_allocation = false;
+
+    if (JeandleCodeBufferInstrument) {
+      tty->print_cr("[JeandleConstPlan] method=%s FALLBACK status=%s failing_section=%u -> legacy consts %zu bytes",
+                    _func_name.c_str(), layout.plan_status,
+                    _const_plan.failed_section_index(), layout.consts_payload);
+    }
+  } else {
+    // Week 5 (F1): tell the CodeBuffer how the consts section itself has to be
+    // aligned BEFORE any blob is sized. Once consts base is aligned to
+    // max_alignment, aligning each section's *relative* offset is equivalent to
+    // aligning its absolute address.
+    _code_buffer.set_const_section_alignment((int)_const_plan.max_alignment());
+
+    layout.consts_payload       = (size_t)_const_plan.total_size();
+    layout.used_legacy_fallback = false;
+    layout.planned_padding      = (size_t)_const_plan.total_padding();
+    layout.planned_alignment    = (size_t)_const_plan.max_alignment();
+    layout.planned_entries      = (size_t)_const_plan.entry_count();
+
+    _planned_consts_size   = (int64_t)_const_plan.total_size();
+    _planned_padding       = layout.planned_padding;
+    _planned_alignment     = layout.planned_alignment;
+    _planned_entries       = layout.planned_entries;
+    _plan_status           = layout.plan_status;
+    _used_exact_allocation = true;
+
+    ConstLayoutStats::record_exact(layout.consts_payload);
+
+    if (JeandleCodeBufferInstrument && _const_plan.entry_count() > 0) {
+      tty->print_cr("[JeandleConstPlan] Method: %s, entries: %zu, planned_total_size: %llu, padding: %llu, max_align: %llu",
+                    _func_name.c_str(), _const_plan.entry_count(),
+                    (unsigned long long)_const_plan.total_size(),
+                    (unsigned long long)_const_plan.total_padding(),
+                    (unsigned long long)_const_plan.max_alignment());
+      for (const auto& entry : _const_plan.entries()) {
+        tty->print_cr("  [PlanEntry] idx=%u, name=%s, size=%llu, align=%llu, planned_offset=%llu",
+                      entry._section_index, entry._section_name.c_str(),
+                      (unsigned long long)entry._size,
+                      (unsigned long long)entry._alignment,
+                      (unsigned long long)entry._consts_offset);
+      }
+    }
+  }
+
+  // CodeBuffer::initialize(inst_size, locs, stubs, oop_recorder) forwards
+  // `inst_size + stubs_size` as the raw code budget, so code_size_input must NOT
+  // already contain the stubs payload. The project brief wrote
+  // insts + consts + stubs here; that would reserve the stubs twice.
+  layout.code_size_input = layout.insts_payload + layout.consts_payload;
+
+  if (JeandleCodeBufferInstrument) {
+    tty->print_cr("[JeandleInstallLayout] method=%s insts=%zu consts=%zu stubs=%zu code_size_input=%zu strategy=%s",
+                  _func_name.c_str(), layout.insts_payload, layout.consts_payload,
+                  layout.stubs_payload, layout.code_size_input,
+                  layout.used_legacy_fallback ? "legacy" : "exact");
+  }
+}
+
+void JeandleCompiledCode::record_finalize_telemetry(jlong elapsed_us) {
+  if (!JeandleCodeBufferInstrument) return;
+  // Early-return failure paths may reach the destructor before the CodeBuffer
+  // ever owned a blob; those are simply not measured.
+  if (_code_buffer.blob() == nullptr) return;
+
+  int64_t actual_used = (int64_t)_code_buffer.consts()->size();
+
+  CodeBufferInstrumentation::instance()->record_finalize(
+    (int)_code_buffer.consts()->size(),
+    (int)_code_buffer.consts()->capacity(),
+    (int)_code_buffer.insts()->size(),
+    (int)_code_buffer.stubs()->size(),
+    elapsed_us,
+    (int)_planned_consts_size,
+    (int)_planned_padding,
+    (int)_planned_alignment,
+    (int)_planned_entries,
+    _plan_status,
+    _used_exact_allocation,
+    _layout_fallback_count);
+
+  if (_used_exact_allocation) {
+    int64_t allocated = (int64_t)_code_buffer.consts()->capacity();
+    // CodeBuffer::initialize_section_size() picks the division point as
+    //   middle = (limit - requested) rounded DOWN to the section alignment
+    // and then grants capacity = limit - middle, i.e.
+    //   capacity = requested + ((limit - requested) & (alignment - 1)).
+    // The extra bytes depend on the absolute blob address (unknown until
+    // BufferBlob::create() runs inside initialize()), not on the request, so
+    // they cannot be planned away -- only bounded, by (alignment - 1).
+    // The governing alignment is the EFFECTIVE one: CodeBuffer floors it at
+    // sizeof(jdouble) via set_const_section_alignment(align_up(align,
+    // HeapWordSize)), so it is NOT necessarily _const_plan.max_alignment().
+    // Reading it back here keeps the bound tied to what CodeBuffer really did.
+    int64_t effective_align = (int64_t)_code_buffer.consts()->alignment();
+    tty->print_cr("[JeandleConstTotal] Method: %s, planned=%lld, allocated=%lld, actual=%lld, diff=%lld, entries=%zu, fallback=%d, align=%lld",
+                  _func_name.c_str(),
+                  (long long)_planned_consts_size, (long long)allocated,
+                  (long long)actual_used,
+                  (long long)(actual_used - _planned_consts_size),
+                  (size_t)_planned_entries, _layout_fallback_count,
+                  (long long)effective_align);
+
+    // The invariant that actually proves exact allocation. Week 5 replaced the
+    // older "0 == 0 passes anyway" check with a three-way comparison:
+    //   planned <= allocated (CodeBuffer may round the division point up)
+    //   allocated - planned < alignment (the rounding is bounded)
+    //   actual    <= allocated          (we never wrote past what we reserved)
+#ifdef ASSERT
+    assert(actual_used <= allocated, "consts wrote past reserved capacity");
+    if (_layout_fallback_count == 0) {
+      assert(allocated >= _planned_consts_size,
+             "allocated consts must cover the planned size");
+      assert((uint64_t)(allocated - _planned_consts_size) < (uint64_t)effective_align,
+             "consts capacity over-allocation must stay within one alignment step");
+      // The invariant that actually proves exact allocation: the payload we
+      // emitted is byte-for-byte what the planner predicted. Capacity may
+      // carry up to (effective_align - 1) bytes of address rounding; the
+      // payload may not.
+      assert(actual_used == _planned_consts_size,
+             "exact allocation must emit exactly the planned consts bytes");
+    }
+#endif
+  }
+}
+
 void JeandleCompiledCode::emit_planned_const_sections(JeandleAssembler& assembler) {
   if (!_const_plan.is_valid() || _const_plan.is_empty()) {
     return;
   }
 
   address consts_start = _code_buffer.consts()->start();
-  JeandleCompilation::current()->set_const_section_alignment((int)_const_plan.max_alignment());
+  // NOTE: set_const_section_alignment() used to be called here. It is too late
+  // at this point: CodeBuffer::initialize() already consumed the alignment to
+  // size the blob and to pick the consts division point. Week 5 moved it into
+  // decide_install_layout(), which runs before any allocation.
 
   for (const auto& entry : _const_plan.entries()) {
     // Direct zero-parsing retrieval using plan entry properties (Fix 2)
@@ -498,6 +671,11 @@ void JeandleCompiledCode::emit_planned_const_sections(JeandleAssembler& assemble
     assert(current_end <= expected_base, "consts buffer overlap or layout inversion");
 
     if (expected_base > current_end) {
+      // F3: zero the alignment gap. BufferBlob memory is reused across
+      // compilations, so leaving it untouched puts stale bytes inside the
+      // nmethod's consts section and makes dumps and future byte-comparisons
+      // non-deterministic.
+      memset(current_end, 0, (size_t)(expected_base - current_end));
       _code_buffer.consts()->set_end(expected_base);
     }
 
@@ -564,9 +742,18 @@ address JeandleCompiledCode::lookup_const_section(llvm::StringRef name, JeandleA
 
 address JeandleCompiledCode::lookup_const_section_fallback(llvm::StringRef name, JeandleAssembler& assembler) {
   _used_const_layout_fallback = true;
+  _layout_fallback_count++;
+  ConstLayoutStats::record_fallback();
 
+  // This is the degradation the project promised to make *visible* rather than
+  // silent (decision D1-A): an unplanned section can only be discovered while
+  // resolving relocations, long after the allocation decision was made, so it
+  // may legitimately force a consts expansion. It is recorded, counted and
+  // attributed, never presented as a target.
   if (JeandleCodeBufferInstrument) {
-    tty->print_cr("[JeandleFallback] Const section %s fell back to dynamic discovery/append!", name.str().c_str());
+    tty->print_cr("[JeandleFallback] method=%s const section=%s not covered by ConstSectionPlan; "
+                  "falling back to dynamic discovery/append",
+                  _func_name.c_str(), name.str().c_str());
   }
 
   SectionInfo section_info(name);
