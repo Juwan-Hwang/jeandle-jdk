@@ -34,6 +34,7 @@ const char* ConstSectionPlan::status_name(ConstPlanStatus status) {
     case ConstPlanStatus::InvalidAlignment:    return "InvalidAlignment";
     case ConstPlanStatus::AlignmentBeyondBase: return "AlignmentBeyondBase";
     case ConstPlanStatus::CapacityOverflow:    return "CapacityOverflow";
+    case ConstPlanStatus::ForcedFallback:      return "ForcedFallback";
     default:                                   return "Unknown";
   }
 }

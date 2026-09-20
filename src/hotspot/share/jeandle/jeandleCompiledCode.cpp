@@ -517,6 +517,16 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
   ConstLayoutStats::record_method();
 
   bool plan_ok = ReadELF::build_const_section_plan(*_elf, _const_plan, CodeEntryAlignment);
+
+  // Diagnostic escape hatch. A real planner failure depends on the ELF
+  // contents, so without this the legacy fallback - the safety net that
+  // keeps Week 5 from being worse than Week 4 when something unexpected
+  // shows up - would never be executed by a test.
+  if (plan_ok && JeandleForceConstPlanFallback) {
+    _const_plan.force_forced_fallback();
+    plan_ok = false;
+  }
+
   layout.plan_status = ConstSectionPlan::status_name(_const_plan.status());
 
   if (!plan_ok) {

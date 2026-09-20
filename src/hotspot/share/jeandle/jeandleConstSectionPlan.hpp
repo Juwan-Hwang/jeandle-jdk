@@ -58,7 +58,8 @@ enum class ConstPlanStatus {
   EmptyPlan,            // no const sections; exact size is 0 (still usable)
   InvalidAlignment,     // sh_addralign is 0, not a power of two, or beyond the contract
   AlignmentBeyondBase,  // alignment exceeds what the consts base address can guarantee
-  CapacityOverflow      // cumulative size or padding overflows uint64
+  CapacityOverflow,     // cumulative size or padding overflows uint64
+  ForcedFallback        // JeandleForceConstPlanFallback: planner forced to fail
 };
 
 // Deterministic layout planner for CodeBuffer consts
@@ -101,6 +102,16 @@ class ConstSectionPlan {
   uint32_t failed_section_index() const { return _failed_index; }
 
   void set_policy(ConstSortPolicy policy) { _policy = policy; }
+
+  // Diagnostic: mark the plan unusable exactly as a planner failure would.
+  // There is no ELF input that reliably triggers a real failure, so
+  // JeandleForceConstPlanFallback uses this to keep the legacy fallback path
+  // covered by tests.
+  void force_forced_fallback() {
+    _is_valid = false;
+    _status = ConstPlanStatus::ForcedFallback;
+    _failed_index = 0;
+  }
 
   // Primary lookup key: by ELF section index (unique identity)
   const ConstSectionPlanEntry* find_by_index(uint32_t section_index) const {
