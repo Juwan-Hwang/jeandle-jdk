@@ -631,32 +631,51 @@ void JeandleCompiledCode::record_finalize_telemetry(jlong elapsed_us) {
     // HeapWordSize)), so it is NOT necessarily _const_plan.max_alignment().
     // Reading it back here keeps the bound tied to what CodeBuffer really did.
     int64_t effective_align = (int64_t)_code_buffer.consts()->alignment();
-    tty->print_cr("[JeandleConstTotal] Method: %s, planned=%lld, allocated=%lld, actual=%lld, diff=%lld, entries=%zu, fallback=%d, align=%lld",
+    // How many times this CodeBuffer grew. CodeBuffer::expand() keeps the dead
+    // incarnation on a chain, so the length of that chain is the expand count.
+    int expand_chain = 0;
+    for (const CodeBuffer* cb = _code_buffer.before_expand(); cb != nullptr; cb = cb->before_expand()) {
+      ++expand_chain;
+    }
+    tty->print_cr("[JeandleConstTotal] Method: %s, planned=%lld, allocated=%lld, actual=%lld, diff=%lld, entries=%zu, fallback=%d, align=%lld, expands=%d",
                   _func_name.c_str(),
                   (long long)_planned_consts_size, (long long)allocated,
                   (long long)actual_used,
                   (long long)(actual_used - _planned_consts_size),
                   (size_t)_planned_entries, _layout_fallback_count,
-                  (long long)effective_align);
+                  (long long)effective_align, expand_chain);
 
-    // The invariant that actually proves exact allocation. Week 5 replaced the
-    // older "0 == 0 passes anyway" check with a three-way comparison:
-    //   planned <= allocated (CodeBuffer may round the division point up)
-    //   allocated - planned < alignment (the rounding is bounded)
-    //   actual    <= allocated          (we never wrote past what we reserved)
+    // Three separate claims, deliberately scoped differently:
+    //   actual    <= allocated   we never wrote past what we reserved; holds
+    //                            unconditionally, this is the safety net.
+    //   actual    == planned     the payload is byte-for-byte what the planner
+    //                            predicted; unaffected by how the section was
+    //                            sized, so also unconditional.
+    //   allocated - planned < A  the address-rounding residual stays below one
+    //                            alignment step. This one only holds for a
+    //                            buffer that was divided up exactly once.
+    //
+    // The bound is derived from CodeBuffer::initialize_section_size(), which
+    // splits the blob that initialize() allocated. Any section expanding later
+    // (in -Xcomp runs it is the un-modelled stubs section, still on its legacy
+    // reservation) makes CodeBuffer::expand() allocate a larger blob and
+    // re-divide every section from the recorded size specs, so the consts
+    // capacity is then bounded by the new blob layout, not by `planned + A - 1`.
+    // Measured in Week 6: a stubs expansion left an empty consts plan holding
+    // exactly CodeSection::end_slop() (64) bytes of capacity. Claiming the
+    // rounding bound there would assert on a CodeBuffer that did nothing wrong;
+    // the expand count is printed above so the case stays observable.
 #ifdef ASSERT
     assert(actual_used <= allocated, "consts wrote past reserved capacity");
     if (_layout_fallback_count == 0) {
-      assert(allocated >= _planned_consts_size,
-             "allocated consts must cover the planned size");
-      assert((uint64_t)(allocated - _planned_consts_size) < (uint64_t)effective_align,
-             "consts capacity over-allocation must stay within one alignment step");
-      // The invariant that actually proves exact allocation: the payload we
-      // emitted is byte-for-byte what the planner predicted. Capacity may
-      // carry up to (effective_align - 1) bytes of address rounding; the
-      // payload may not.
       assert(actual_used == _planned_consts_size,
              "exact allocation must emit exactly the planned consts bytes");
+      if (expand_chain == 0) {
+        assert(allocated >= _planned_consts_size,
+               "allocated consts must cover the planned size");
+        assert((uint64_t)(allocated - _planned_consts_size) < (uint64_t)effective_align,
+               "consts capacity over-allocation must stay within one alignment step");
+      }
     }
 #endif
   }
