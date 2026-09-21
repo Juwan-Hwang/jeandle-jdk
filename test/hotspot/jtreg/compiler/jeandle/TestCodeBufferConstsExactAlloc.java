@@ -32,7 +32,11 @@
  *            2. the consts capacity that CodeBuffer hands out never exceeds
  *               what is actually used by more than one alignment step.
  *
- *          Point 2 is the tightest bound that can be asserted:
+ *   Point 2: for a buffer that never expanded, the reserved capacity may exceed
+ *            the planned size by at most one alignment step. A buffer that did
+ *            expand is re-divided by CodeBuffer::expand(), so its residual is
+ *            not bounded by the alignment and is checked only for safety
+ *            (usage <= capacity, usage == planned).
  *          CodeBuffer::initialize_section_size() rounds the section start down
  *          to the section alignment, so the capacity is
  *          requested + ((limit - requested) % alignment). The extra bytes are

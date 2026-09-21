@@ -121,8 +121,8 @@ void CodeBuffer::initialize(csize_t code_size, csize_t locs_size) {
     _insts.initialize_locs(locs_size / sizeof(relocInfo));
   }
 
-  if (JeandleCodeBufferInstrument) {
-    CodeBufferInstrumentation::instance()->record_initialize(_name, code_size, 0, 0, locs_size);
+  if (CodeBufferInstrumentation::enabled()) {
+    CodeBufferInstrumentation::instance()->record_initialize(this, _name, code_size, 0, 0, locs_size);
   }
 
   debug_only(verify_section_allocation();)
@@ -139,8 +139,8 @@ void CodeBuffer::initialize(csize_t inst_size,
   initialize_section_size(&_stubs, stubs_size);
   initialize_oop_recorder(oop_recorder);
 
-  if (JeandleCodeBufferInstrument) {
-    CodeBufferInstrumentation::instance()->record_initialize(_name, inst_size, 0, stubs_size, locs_size);
+  if (CodeBufferInstrumentation::enabled()) {
+    CodeBufferInstrumentation::instance()->record_initialize(this, _name, inst_size, 0, stubs_size, locs_size);
   }
 }
 
@@ -161,6 +161,12 @@ CodeBuffer::~CodeBuffer() {
   }
   if (_shared_trampoline_requests != nullptr) {
     delete _shared_trampoline_requests;
+  }
+
+  if (CodeBufferInstrumentation::enabled()) {
+    // Close the record for this buffer: the address may be handed to a later
+    // CodeBuffer, and two different compilations must not share one record.
+    CodeBufferInstrumentation::instance()->record_retire(this);
   }
 
   NOT_PRODUCT(clear_strings());
@@ -908,9 +914,9 @@ void CodeBuffer::expand(CodeSection* which_cs, csize_t amount) {
   csize_t new_total_cap
     = figure_expanded_capacities(which_cs, amount, new_capacity);
 
-  if (JeandleCodeBufferInstrument) {
+  if (CodeBufferInstrumentation::enabled()) {
     int sect = (int)(which_cs - &_consts);
-    CodeBufferInstrumentation::instance()->record_expand(sect, amount, new_total_cap, expand_timer.elapsed_us());
+    CodeBufferInstrumentation::instance()->record_expand(this, sect, amount, new_total_cap, expand_timer.elapsed_us());
   }
 
   // Create a new (temporary) code buffer to hold all the new data

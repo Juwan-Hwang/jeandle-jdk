@@ -1,11 +1,12 @@
 #include "precompiled.hpp"
 #include "asm/codeBufferInstrumentation.hpp"
+#include "runtime/mutexLocker.hpp"
 #include "runtime/globals_shared.hpp"
 #include "compiler/compiler_globals.hpp"
 #include "utilities/ostream.hpp"
 #include "runtime/os.hpp"
 
-CodeBufferInstrumentation* CodeBufferInstrumentation::_instance = nullptr;
+std::atomic<CodeBufferInstrumentation*> CodeBufferInstrumentation::_instance(nullptr);
 
 // ---- ConstLayoutStats ----
 
@@ -50,27 +51,128 @@ void ConstLayoutStats::print_on(outputStream* st) {
 
 // ---- CodeBufferInstrumentation ----
 
-CodeBufferInstrumentation* CodeBufferInstrumentation::instance() {
-  if (_instance == nullptr) {
-    _instance = new CodeBufferInstrumentation();
-  }
-  return _instance;
+// The instance pointer is published atomically: the first compiler threads to
+// arrive must not each build their own.
+bool CodeBufferInstrumentation::enabled() {
+#ifndef PRODUCT
+  return JeandleCodeBufferInstrument;
+#else
+  return false;
+#endif
 }
 
-void CodeBufferInstrumentation::record_initialize(const char* name, int code_size,
+const char* CodeBufferInstrumentation::output_path(char* buf, size_t buflen) {
+#ifndef PRODUCT
+  const char* pattern = JeandleCodeBufferInstrumentFile;
+  const char* p = strchr(pattern, '%');
+  if (p != nullptr && p[1] == 'p') {
+    // Same convention as -XX:ErrorFile: %p expands to the process id, so
+    // concurrent JVMs and repeated runs cannot overwrite each other.
+    char prefix[256];
+    size_t len = (size_t)(p - pattern);
+    if (len >= sizeof(prefix)) {
+      len = sizeof(prefix) - 1;
+    }
+    memcpy(prefix, pattern, len);
+    prefix[len] = '\0';
+    os::snprintf(buf, buflen, "%s%d%s", prefix, os::current_process_id(), p + 2);
+    return buf;
+  }
+  os::snprintf(buf, buflen, "%s", pattern);
+  return buf;
+#else
+  buf[0] = '\0';
+  return buf;
+#endif
+}
+
+CodeBufferInstrumentation* CodeBufferInstrumentation::instance() {
+  CodeBufferInstrumentation* result = _instance.load(std::memory_order_acquire);
+  if (result == nullptr) {
+    CodeBufferInstrumentation* candidate = new CodeBufferInstrumentation();
+    CodeBufferInstrumentation* expected = nullptr;
+    if (_instance.compare_exchange_strong(expected, candidate, std::memory_order_release)) {
+      result = candidate;
+    } else {
+      delete candidate;
+      result = expected;
+    }
+  }
+  return result;
+}
+
+// Scanned from the end because a buffer is recorded and then used immediately; a
+// -Xcomp run holds a few thousand records, which is cheap for a facility that is
+// off by default. Callers create a record when the lookup fails, so an event can
+// never be lost - the old code could only mis-attribute it.
+CodeBufferInstrumentation::Record* CodeBufferInstrumentation::find_locked(const CodeBuffer* cb) const {
+  for (int i = _records.length() - 1; i >= 0; i--) {
+    if (_records.at(i)->_buffer == cb && !_records.at(i)->_retired) {
+      return _records.at(i);
+    }
+  }
+  return nullptr;
+}
+
+void CodeBufferInstrumentation::record_retire(const CodeBuffer* cb) {
+  if (!enabled()) return;
+  CodeBufferInstrumentation* inst = instance();
+  MutexLocker ml(&inst->_lock, Mutex::_no_safepoint_check_flag);
+  Record* r = inst->find_locked(cb);
+  if (r != nullptr) {
+    r->_retired = true;
+  }
+}
+
+void CodeBufferInstrumentation::record_initialize(const CodeBuffer* cb, const char* name, int code_size,
                                                    int consts_cap, int stubs_size,
                                                    int locs_size) {
-  if (!JeandleCodeBufferInstrument) return;
-  Record* r = new Record(name, code_size, consts_cap, stubs_size, locs_size);
-  instance()->_records.append(r);
+  if (!enabled()) return;
+  // Allocate before taking the lock: _records is written from several compiler
+  // threads, but the lock must not be held across allocation.
+  Record* fresh = new Record(name, code_size, consts_cap, stubs_size, locs_size);
+  fresh->_buffer = cb;
+  CodeBufferInstrumentation* inst = instance();
+  {
+    MutexLocker ml(&inst->_lock, Mutex::_no_safepoint_check_flag);
+    Record* r = inst->find_locked(cb);
+    if (r == nullptr) {
+      inst->_records.append(fresh);
+      return;
+    }
+    // A repeated initialize() for the same live buffer carries better numbers
+    // (the delegating overload only sees the combined code size; Jeandle knows
+    // the consts capacity). Keep the most informative value per field instead
+    // of appending a duplicate record.
+    if (code_size  > r->_initial_code_size)       r->_initial_code_size = code_size;
+    if (consts_cap > r->_initial_consts_capacity) r->_initial_consts_capacity = consts_cap;
+    if (stubs_size > r->_initial_stubs_size)      r->_initial_stubs_size = stubs_size;
+    if (locs_size  > r->_initial_locs_size)       r->_initial_locs_size = locs_size;
+  }
+  delete fresh;
 }
 
-void CodeBufferInstrumentation::record_expand(int section, int amount,
+void CodeBufferInstrumentation::record_expand(const CodeBuffer* cb, int section, int amount,
                                                int new_total_cap, jlong elapsed_us) {
-  if (!JeandleCodeBufferInstrument) return;
+  if (!enabled()) return;
+  // Allocated before the lock (see record_initialize) so that nothing that can
+  // take another lock happens while _lock is held.
+  Record* fresh = new Record("unknown", 0, 0, 0, 0);
+  fresh->_buffer = cb;
   CodeBufferInstrumentation* inst = instance();
-  if (inst->_records.is_empty()) return;
-  Record* r = inst->_records.at(inst->current_index());
+  Record* r;
+  {
+    MutexLocker ml(&inst->_lock, Mutex::_no_safepoint_check_flag);
+    r = inst->find_locked(cb);
+    if (r == nullptr) {
+      r = fresh;
+      inst->_records.append(r);
+      fresh = nullptr;
+    }
+  }
+  if (fresh != nullptr) {
+    delete fresh;
+  }
   ExpansionEvent e = {section, amount, new_total_cap, elapsed_us};
   r->_expansions.append(e);
   r->_expand_count++;
@@ -85,7 +187,8 @@ void CodeBufferInstrumentation::record_expand(int section, int amount,
   }
 }
 
-void CodeBufferInstrumentation::record_finalize(int consts_size, int consts_cap,
+void CodeBufferInstrumentation::record_finalize(const CodeBuffer* cb,
+                                                int consts_size, int consts_cap,
                                                  int insts_size, int stubs_size,
                                                  jlong finalize_latency_us,
                                                  int planned_consts_size,
@@ -95,10 +198,26 @@ void CodeBufferInstrumentation::record_finalize(int consts_size, int consts_cap,
                                                  const char* plan_status,
                                                  bool used_exact_allocation,
                                                  int layout_fallback_count) {
-  if (!JeandleCodeBufferInstrument) return;
+  if (!enabled()) return;
+  // Allocated before the lock (see record_initialize) so that nothing that can
+  // take another lock happens while _lock is held.
+  Record* fresh = new Record("unknown", 0, 0, 0, 0);
+  fresh->_buffer = cb;
   CodeBufferInstrumentation* inst = instance();
-  if (inst->_records.is_empty()) return;
-  Record* r = inst->_records.at(inst->current_index());
+  Record* r;
+  {
+    MutexLocker ml(&inst->_lock, Mutex::_no_safepoint_check_flag);
+    r = inst->find_locked(cb);
+    if (r == nullptr) {
+      r = fresh;
+      inst->_records.append(r);
+      fresh = nullptr;
+    }
+  }
+  if (fresh != nullptr) {
+    delete fresh;
+  }
+  r->_finalized = true;
   r->_final_consts_size = consts_size;
   r->_final_consts_capacity = consts_cap;
   r->_final_insts_size = insts_size;
@@ -119,18 +238,23 @@ CodeBufferInstrumentation::Summary CodeBufferInstrumentation::compute_summary() 
   for (int i = 0; i < _records.length(); i++) {
     const Record* r = _records.at(i);
     s.total_records++;
+    if (r->_finalized) { s.finalized_records++; } else { s.unfinalized_records++; }
 
     // A section that was never given a capacity is treated as "not allocated"
     // rather than "zero", so counts stay comparable between strategies.
-    if (r->_final_consts_capacity > 0) {
+    // Only a finalized record describes a compilation that actually happened; a
+    // temporary CodeBuffer from expand() must not inflate these totals.
+    if (r->_finalized && r->_final_consts_capacity > 0) {
       s.consts_allocating++;
       s.consts_capacity += r->_final_consts_capacity;
       s.consts_usage += r->_final_consts_size;
     }
-    if (r->_planned_consts_size >= 0) {
+    if (r->_finalized && r->_planned_consts_size >= 0) {
       s.planned_size_sum += r->_planned_consts_size;
     }
-    if (r->_planned_consts_size > 0) {
+    if (!r->_finalized) {
+      // outside both populations; visible via unfinalized_records
+    } else if (r->_planned_consts_size > 0) {
       s.nonempty_consts++;
     } else {
       s.zero_consts++;
@@ -167,7 +291,8 @@ void CodeBufferInstrumentation::output_json() {
 
   Summary s = compute_summary();
 
-  const char* path = "/tmp/codebuffer_instrument.json";
+  char path_buf[512];
+  const char* path = output_path(path_buf, sizeof(path_buf));
   FILE* fp = os::fopen(path, "w");
   if (fp == nullptr) {
     tty->print_cr("CodeBufferInstrumentation: failed to open %s", path);
@@ -211,6 +336,7 @@ void CodeBufferInstrumentation::output_json() {
 
     fprintf(fp, "    {\n");
     fprintf(fp, "      \"index\": %d,\n", i);
+    fprintf(fp, "      \"finalized\": %s,\n", r->_finalized ? "true" : "false");
     fprintf(fp, "      \"name\": \"%s\",\n", r->_name ? r->_name : "");
     fprintf(fp, "      \"initial\": {\n");
     fprintf(fp, "        \"code_size\": %d,\n", r->_initial_code_size);
@@ -257,7 +383,8 @@ void CodeBufferInstrumentation::output_json() {
 
   tty->print_cr("=== CodeBuffer Instrumentation Summary ===");
   tty->print_cr("  Counting unit: recorded CodeBuffer initialize()");
-  tty->print_cr("  Total records: %d", s.total_records);
+  tty->print_cr("  Total records: %d (finalized %d, temporary/unfinalized %d)",
+                s.total_records, s.finalized_records, s.unfinalized_records);
   tty->print_cr("    consts section allocated:     %d", s.consts_allocating);
   tty->print_cr("    with const sections:          %d", s.nonempty_consts);
   tty->print_cr("    without const sections:       %d", s.zero_consts);
@@ -277,6 +404,6 @@ void CodeBufferInstrumentation::output_json() {
 }
 
 void CodeBufferInstrumentation::output_and_shutdown() {
-  if (!JeandleCodeBufferInstrument) return;
+  if (!enabled()) return;
   instance()->output_json();
 }

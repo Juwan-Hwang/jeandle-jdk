@@ -5,9 +5,11 @@
 #include "utilities/ticks.hpp"
 #include "utilities/growableArray.hpp"
 #include "runtime/atomic.hpp"
+#include "runtime/mutex.hpp"
 #include <atomic>
 
 class outputStream;
+class CodeBuffer;   // records are keyed by buffer identity
 
 class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
  private:
@@ -20,6 +22,18 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
 
   // Per-compilation record with full telemetry
   struct Record {
+    // The buffer this record belongs to. Everything is looked up through this
+    // pointer now: addressing "the last appended record" mis-attributed data
+    // whenever CodeBuffer::expand() created a temporary buffer (audit §1).
+    const CodeBuffer* _buffer = nullptr;
+    // Set once finalize() reported this buffer. Records without it belong to
+    // temporary or unfinished buffers: counted, never summed (audit §1.2).
+    bool _finalized = false;
+    // A CodeBuffer's address is reused once that buffer dies, so the pointer is
+    // only unique while the buffer is alive: ~CodeBuffer() retires the record and a
+    // later buffer at the same address gets a fresh one. Without this, 1424
+    // compilations collapsed onto a dozen reused addresses.
+    bool _retired = false;
     const char* _name;
     // Initial allocation (from CodeBuffer::initialize + initialize_consts_size)
     int  _initial_code_size;       // total code buffer size requested
@@ -67,8 +81,17 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
     }
   };
 
-  static CodeBufferInstrumentation* _instance;
+  // Published atomically: the first compiler threads to arrive must not each
+  // build their own instance.
+  static std::atomic<CodeBufferInstrumentation*> _instance;
+  // Appended from several compiler threads, so it needs a lock: a bare array made
+  // this a data race, and it is also why length()-1 meant nothing (audit §2).
+  // Taken as a leaf: nothing else is locked while holding it, and records are
+  // allocated before the lock is taken. The rank sits below CodeCache_lock
+  // (nosafepoint-2) because ~CodeBuffer and initialize() can run while that lock
+  // is held; a higher rank trips the lock-order assert.
   GrowableArrayCHeap<Record*, mtCompiler> _records;
+  Mutex _lock;
   bool _output_done;
 
   // One unambiguous counting unit for every number this tool reports.
@@ -80,6 +103,8 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
   // population: the recorded initialize() calls.
   struct Summary {
     int total_records;        // every recorded initialize() -> the counting unit
+    int finalized_records;    // records a real compilation finished
+    int unfinalized_records;  // temporary / never-finalized buffers
     int consts_allocating;    // records that actually reserved a consts section
     int nonempty_consts;      // records planning at least one const section
     int zero_consts;          // records planning none
@@ -100,20 +125,38 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
 
   Summary compute_summary() const;
 
-  CodeBufferInstrumentation() : _records(8), _output_done(false) {}
+  // Declaration order is _records, _lock, _output_done - the initializer list must
+  // follow it (-Werror=reorder).
+  CodeBufferInstrumentation() : _records(8),
+                                  _lock(Mutex::nosafepoint - 4, "CodeBufferInstrumentation_lock"),
+                                  _output_done(false) {}
   void output_json();
 
  public:
   static CodeBufferInstrumentation* instance();
 
-  void record_initialize(const char* name, int code_size, int consts_cap,
-                         int stubs_size, int locs_size);
+  // The only place the develop flags are read. In a product build both fold away
+  // to false/nullptr, so no #ifdef is needed at the dozen call sites.
+  static bool enabled();
+  // Copies the configured output path into buf, expanding %p like -XX:ErrorFile.
+  static const char* output_path(char* buf, size_t buflen);
 
-  void record_expand(int section, int amount, int new_total_cap, jlong elapsed_us);
+  // Idempotent per buffer. CodeBuffer::initialize() is entered twice for the
+  // 4-argument form (delegating overload) and Jeandle calls it a third time,
+  // which used to append three records for one compilation (audit §1.3).
+  void record_initialize(const CodeBuffer* cb, const char* name, int code_size,
+                         int consts_cap, int stubs_size, int locs_size);
+
+  // Called from ~CodeBuffer(): closes the record so the address can be reused.
+  void record_retire(const CodeBuffer* cb);
+
+  void record_expand(const CodeBuffer* cb, int section, int amount,
+                     int new_total_cap, jlong elapsed_us);
 
   // Enhanced finalize: captures actual usage + capacity + latency + plan telemetry.
   // planned_consts_size < 0 => planner not used (legacy path).
-  void record_finalize(int consts_size, int consts_cap, int insts_size,
+  void record_finalize(const CodeBuffer* cb, int consts_size, int consts_cap,
+                       int insts_size,
                        int stubs_size, jlong finalize_latency_us,
                        int planned_consts_size, int planned_padding,
                        int planned_alignment, int const_entries,
@@ -121,7 +164,11 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
                        int layout_fallback_count);
 
   static void output_and_shutdown();
-  int current_index() const { return _records.length() - 1; }
+
+ private:
+  // Caller must hold _lock. The record for `cb`, or nullptr.
+  Record* find_locked(const CodeBuffer* cb) const;
+
 };
 
 // Aggregate counters for the deterministic const layout work.

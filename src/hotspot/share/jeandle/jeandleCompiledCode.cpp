@@ -228,9 +228,10 @@ void JeandleCompiledCode::finalize() {
   }
   _code_buffer.initialize_consts_size(layout.consts_payload);
 
-  if (JeandleCodeBufferInstrument) {
+  if (CodeBufferInstrumentation::enabled()) {
     CodeBufferInstrumentation::instance()->record_initialize(
-      _code_buffer.name(), (int)layout.code_size_input, (int)layout.consts_payload,
+      &_code_buffer, _code_buffer.name(), (int)layout.code_size_input,
+      (int)layout.consts_payload,
       (int)layout.stubs_payload, (int)layout.locs_payload);
   }
 
@@ -538,7 +539,7 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
     _planned_consts_size = -1;
     _used_exact_allocation = false;
 
-    if (JeandleCodeBufferInstrument) {
+    if (CodeBufferInstrumentation::enabled()) {
       tty->print_cr("[JeandleConstPlan] method=%s FALLBACK status=%s failing_section=%u -> legacy consts %zu bytes",
                     _func_name.c_str(), layout.plan_status,
                     _const_plan.failed_section_index(), layout.consts_payload);
@@ -565,7 +566,7 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
 
     ConstLayoutStats::record_exact(layout.consts_payload);
 
-    if (JeandleCodeBufferInstrument && _const_plan.entry_count() > 0) {
+    if (CodeBufferInstrumentation::enabled() && _const_plan.entry_count() > 0) {
       tty->print_cr("[JeandleConstPlan] Method: %s, entries: %zu, planned_total_size: %llu, padding: %llu, max_align: %llu",
                     _func_name.c_str(), _const_plan.entry_count(),
                     (unsigned long long)_const_plan.total_size(),
@@ -587,7 +588,7 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
   // insts + consts + stubs here; that would reserve the stubs twice.
   layout.code_size_input = layout.insts_payload + layout.consts_payload;
 
-  if (JeandleCodeBufferInstrument) {
+  if (CodeBufferInstrumentation::enabled()) {
     tty->print_cr("[JeandleInstallLayout] method=%s insts=%zu consts=%zu stubs=%zu code_size_input=%zu strategy=%s",
                   _func_name.c_str(), layout.insts_payload, layout.consts_payload,
                   layout.stubs_payload, layout.code_size_input,
@@ -596,14 +597,14 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
 }
 
 void JeandleCompiledCode::record_finalize_telemetry(jlong elapsed_us) {
-  if (!JeandleCodeBufferInstrument) return;
+  if (!CodeBufferInstrumentation::enabled()) return;
   // Early-return failure paths may reach the destructor before the CodeBuffer
   // ever owned a blob; those are simply not measured.
   if (_code_buffer.blob() == nullptr) return;
 
   int64_t actual_used = (int64_t)_code_buffer.consts()->size();
 
-  CodeBufferInstrumentation::instance()->record_finalize(
+  CodeBufferInstrumentation::instance()->record_finalize(&_code_buffer,
     (int)_code_buffer.consts()->size(),
     (int)_code_buffer.consts()->capacity(),
     (int)_code_buffer.insts()->size(),
@@ -716,7 +717,7 @@ void JeandleCompiledCode::emit_planned_const_sections(JeandleAssembler& assemble
     _const_section_addrs_by_index.insert({entry._section_index, expected_base});
     _const_sections.insert({entry._section_name, expected_base});
 
-    if (JeandleCodeBufferInstrument) {
+    if (CodeBufferInstrumentation::enabled()) {
       tty->print_cr("[JeandlePlannedEmit] Method: %s, Section: %s, idx=%u, offset=%llu, size=%llu, base=" PTR_FORMAT,
                     _func_name.c_str(), entry._section_name.c_str(), entry._section_index,
                     (unsigned long long)entry._consts_offset,
@@ -779,7 +780,7 @@ address JeandleCompiledCode::lookup_const_section_fallback(llvm::StringRef name,
   // resolving relocations, long after the allocation decision was made, so it
   // may legitimately force a consts expansion. It is recorded, counted and
   // attributed, never presented as a target.
-  if (JeandleCodeBufferInstrument) {
+  if (CodeBufferInstrumentation::enabled()) {
     tty->print_cr("[JeandleFallback] method=%s const section=%s not covered by ConstSectionPlan; "
                   "falling back to dynamic discovery/append",
                   _func_name.c_str(), name.str().c_str());
