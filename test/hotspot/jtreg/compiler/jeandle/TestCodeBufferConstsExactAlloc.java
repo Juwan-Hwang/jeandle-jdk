@@ -45,6 +45,7 @@
  *
  * @requires vm.debug == true
  * @library /test/lib
+ * @build compiler.jeandle.TestCodeBufferConstValues
  * @run driver compiler.jeandle.TestCodeBufferConstsExactAlloc
  */
 
@@ -60,7 +61,7 @@ import jdk.test.lib.process.ProcessTools;
 public class TestCodeBufferConstsExactAlloc {
 
     private static final Pattern CONST_TOTAL =
-            Pattern.compile("align=(\\d+)");
+            Pattern.compile("\\[JeandleConstTotal\\].*?planned=(\\d+), allocated=(\\d+), actual=(\\d+),.*?fallback=(\\d+), align=(\\d+), expands=(\\d+)");
 
     // Per-method CodeBuffer expansion count, reported on the [JeandleConstTotal]
     // line as `expands=<n>`.
@@ -68,7 +69,7 @@ public class TestCodeBufferConstsExactAlloc {
             Pattern.compile("expands=(\\d+)");
 
     public static void main(String[] args) throws Exception {
-        ProcessBuilder pb = ProcessTools.createJavaProcessBuilder(
+        ProcessBuilder pb = ProcessTools.createTestJavaProcessBuilder(
                 "-XX:+UnlockDiagnosticVMOptions",
                 "-XX:+UseJeandleCompiler",
                 "-XX:+JeandleCodeBufferInstrument",
@@ -111,36 +112,45 @@ public class TestCodeBufferConstsExactAlloc {
         Asserts.assertGT(usage, 0L, "the workload must emit at least one const byte");
         Asserts.assertGTE(capacity, usage, "capacity must cover the emitted consts");
 
-        long maxAlign = 1;
+        // Check the rounding bound per method, not on the aggregate. Two buffers
+        // that each rounded up by align/2 aggregate into a residual of exactly
+        // align, which would "violate" a bound that holds for every single buffer:
+        // CodeBuffer's invariant is per buffer, and only for a buffer that was
+        // divided up once (an expansion re-divides the whole blob). This mirrors
+        // the assert in jeandleCompiledCode.cpp::finalize().
+        long perMethodBound = 0;
         Matcher m = CONST_TOTAL.matcher(stdout);
         while (m.find()) {
-            maxAlign = Math.max(maxAlign, Long.parseLong(m.group(1)));
-        }
-
-        // The rounding bound only describes a CodeBuffer that was divided up once.
-        // If any section expanded, CodeBuffer::expand() allocated a larger blob and
-        // re-divided every section, so a section whose plan was exact can legitimately
-        // end up with more capacity than planned + alignment - 1. The per-method
-        // `expands=` field says which case a run was in; skip the aggregate bound in
-        // the expanded case, but report it rather than hiding it.
-        int expandedMethods = 0;
-        Matcher e = EXPANDS.matcher(stdout);
-        while (e.find()) {
-            if (Long.parseLong(e.group(1)) > 0) {
-                expandedMethods++;
+            long planned  = Long.parseLong(m.group(1));
+            long allocated = Long.parseLong(m.group(2));
+            long actual   = Long.parseLong(m.group(3));
+            long fallback = Long.parseLong(m.group(4));
+            long align    = Long.parseLong(m.group(5));
+            long expands  = Long.parseLong(m.group(6));
+            Asserts.assertLTE(actual, allocated,
+                    "a method must not write past the consts capacity (method line "
+                            + m.group(0) + ")");
+            if (fallback > 0) {
+                continue;   // the layout degraded; the exact-allocation bound does not apply
             }
+            Asserts.assertEQ(actual, planned,
+                    "exact allocation must emit exactly the planned consts bytes");
+            if (expands > 0) {
+                continue;   // re-divided by CodeBuffer::expand(); residual is not bounded by align
+            }
+            perMethodBound++;
+            Asserts.assertGTE(allocated, planned,
+                    "an unexpanded buffer cannot hand out less than it was asked for");
+            Asserts.assertLTE(allocated - planned, align - 1,
+                    "consts over-allocation must stay within one alignment step for a"
+                            + " buffer that never expanded (planned=" + planned
+                            + ", allocated=" + allocated + ", align=" + align + ")");
         }
-        if (expandedMethods == 0) {
-            Asserts.assertLTE(capacity - usage, maxAlign - 1,
-                    "consts over-allocation must stay within one alignment step"
-                            + " (capacity=" + capacity + ", usage=" + usage
-                            + ", align=" + maxAlign + ")");
-        } else {
-            System.out.println("note: " + expandedMethods
-                    + " method(s) expanded; the aggregate rounding bound does not"
-                    + " apply to re-divided buffers and was skipped"
-                    + " (capacity=" + capacity + ", usage=" + usage + ")");
-        }
+        Asserts.assertGT(perMethodBound, 0L,
+                "no method line was checked; the per-method bound would be vacuous");
+        System.out.println("note: rounding bound checked on " + perMethodBound
+                + " unexpanded method line(s); aggregate was capacity=" + capacity
+                + ", usage=" + usage + " (aggregate residual is not a valid invariant)");
 
         // The consts CodeSection itself must never have been expanded.
         int constsExpands = expandCount(stdout);

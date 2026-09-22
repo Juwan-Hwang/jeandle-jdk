@@ -34,6 +34,7 @@
  *
  * @requires vm.debug == true
  * @library /test/lib
+ * @build compiler.jeandle.TestCodeBufferConstValues
  * @run driver compiler.jeandle.TestCodeBufferConstsFallback
  */
 
@@ -46,7 +47,7 @@ import jdk.test.lib.process.ProcessTools;
 public class TestCodeBufferConstsFallback {
 
     public static void main(String[] args) throws Exception {
-        ProcessBuilder pb = ProcessTools.createJavaProcessBuilder(
+        ProcessBuilder pb = ProcessTools.createTestJavaProcessBuilder(
                 "-XX:+UnlockDiagnosticVMOptions",
                 "-XX:+UseJeandleCompiler",
                 "-XX:+JeandleCodeBufferInstrument",
