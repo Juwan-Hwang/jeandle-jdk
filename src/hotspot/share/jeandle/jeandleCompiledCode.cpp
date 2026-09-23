@@ -517,7 +517,19 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
 
   ConstLayoutStats::record_method();
 
-  bool plan_ok = ReadELF::build_const_section_plan(*_elf, _const_plan, CodeEntryAlignment);
+  // W6 base-alignment safety fix: the planner's F1 guard only protects us when the value it is given really is
+  // the alignment of the consts base. BufferBlob memory is only word-aligned, and a
+  // temporary probe measured the base at 8 mod 16 for 47/78 methods on x86_64 and
+  // 51/115 on aarch64 - while CodeEntryAlignment is 32/64 there, so passing it made the
+  // guard unable to fire for a 16-byte constant. aarch64 then dies on its relocation
+  // guarantee (relocInfo_aarch64.cpp:130); x86 has no such check and emits the
+  // misalignment silently. Trust only what allocation guarantees until the layout is
+  // made absolute (P1). Evidence: artifacts/w6_consts_base_alignment.txt.
+  // Not constexpr: CodeEntryAlignment is a runtime flag, so its value is not usable in
+  // a constant expression (this was caught by the compiler, not by reading).
+  const uint64_t guaranteed_base_align =
+      MIN2((uint64_t)CodeEntryAlignment, (uint64_t)HeapWordSize);
+  bool plan_ok = ReadELF::build_const_section_plan(*_elf, _const_plan, guaranteed_base_align);
 
   // Diagnostic escape hatch. A real planner failure depends on the ELF
   // contents, so without this the legacy fallback - the safety net that
