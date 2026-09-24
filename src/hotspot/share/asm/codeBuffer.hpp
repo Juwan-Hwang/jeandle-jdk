@@ -34,6 +34,7 @@
 #include "utilities/linkedlist.hpp"
 #include "utilities/resizeableResourceHash.hpp"
 #include "utilities/macros.hpp"
+#include "asm/codeBufferInstrumentation.hpp"
 
 template <typename T>
 static inline void put_native(address p, T x) {

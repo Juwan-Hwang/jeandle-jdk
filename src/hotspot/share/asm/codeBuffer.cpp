@@ -121,6 +121,10 @@ void CodeBuffer::initialize(csize_t code_size, csize_t locs_size) {
     _insts.initialize_locs(locs_size / sizeof(relocInfo));
   }
 
+  if (CodeBufferInstrumentation::enabled()) {
+    CodeBufferInstrumentation::instance()->record_initialize(this, _name, code_size, 0, 0, locs_size);
+  }
+
   debug_only(verify_section_allocation();)
 }
 
@@ -134,6 +138,10 @@ void CodeBuffer::initialize(csize_t inst_size,
   }
   initialize_section_size(&_stubs, stubs_size);
   initialize_oop_recorder(oop_recorder);
+
+  if (CodeBufferInstrumentation::enabled()) {
+    CodeBufferInstrumentation::instance()->record_initialize(this, _name, inst_size, 0, stubs_size, locs_size);
+  }
 }
 
 CodeBuffer::~CodeBuffer() {
@@ -153,6 +161,12 @@ CodeBuffer::~CodeBuffer() {
   }
   if (_shared_trampoline_requests != nullptr) {
     delete _shared_trampoline_requests;
+  }
+
+  if (CodeBufferInstrumentation::enabled()) {
+    // Close the record for this buffer: the address may be handed to a later
+    // CodeBuffer, and two different compilations must not share one record.
+    CodeBufferInstrumentation::instance()->record_retire(this);
   }
 
   NOT_PRODUCT(clear_strings());
@@ -870,6 +884,7 @@ csize_t CodeBuffer::figure_expanded_capacities(CodeSection* which_cs,
 }
 
 void CodeBuffer::expand(CodeSection* which_cs, csize_t amount) {
+
 #ifndef PRODUCT
   if (PrintNMethods && (WizardMode || Verbose)) {
     tty->print("expanding CodeBuffer:");
@@ -897,6 +912,16 @@ void CodeBuffer::expand(CodeSection* which_cs, csize_t amount) {
   memset(new_capacity, 0, sizeof(csize_t) * SECT_LIMIT);
   csize_t new_total_cap
     = figure_expanded_capacities(which_cs, amount, new_capacity);
+
+  if (CodeBufferInstrumentation::enabled()) {
+    // Declared here rather than at the top of expand(): with the instrumentation off
+    // this path must cost nothing. Index by explicit comparison - deriving it from the
+    // address difference of CodeBuffer members worked only because _consts, _insts and
+    // _stubs happen to be adjacent, and would break silently if they ever move apart.
+    CodeBufferTimer expand_timer;
+    const int sect = (which_cs == &_consts) ? 0 : ((which_cs == &_insts) ? 1 : 2);
+    CodeBufferInstrumentation::instance()->record_expand(this, sect, amount, new_total_cap, expand_timer.elapsed_us());
+  }
 
   // Create a new (temporary) code buffer to hold all the new data
   CodeBuffer cb(name(), new_total_cap, 0);

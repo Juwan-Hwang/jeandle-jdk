@@ -84,7 +84,21 @@
           "counted loops (0 disables strip mining).")                       \
           range(0, max_juint)                                               \
                                                                             \
-// end of JEANDLE_FLAGS
+  develop(bool, JeandleCodeBufferInstrument, false,                         \
+          "Instrument CodeBuffer allocation, expansion, and finalization "  \
+          "to collect baseline data for the deterministic layout work. "    \
+          "Writes JSON at VM exit; path: JeandleCodeBufferInstrumentFile.")      \
+                                                                          \
+  develop(ccstr, JeandleCodeBufferInstrumentFile,                                \
+          "/tmp/codebuffer_instrument.json",                                     \
+          "Where JeandleCodeBufferInstrument writes its JSON report. %p is "     \
+          "replaced by the process id, like -XX:ErrorFile, so concurrent "       \
+          "JVMs and repeated runs cannot overwrite each other.")   \
+                                                                            \
+  develop(bool, JeandleForceConstPlanFallback, false,                       \
+          "Force the const section planner to fail so that the legacy "     \
+          "6144*wordSize consts reservation is exercised (testing only).")  \
+                                                                            // end of JEANDLE_FLAGS
 
 DECLARE_FLAGS(JEANDLE_FLAGS)
 
