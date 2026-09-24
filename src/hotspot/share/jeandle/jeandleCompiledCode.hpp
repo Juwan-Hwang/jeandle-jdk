@@ -179,8 +179,44 @@ struct JeandleDeferredVORefField {
   int voref_id;
 };
 
+// Week 5: every capacity decision for one CodeBuffer installation.
+//
+// The project brief proposed six fields. Week 5 keeps those and adds the
+// fields needed to make each allocation decision *explainable* afterwards:
+// if we allocated exactly, we must also be able to say which plan produced
+// the size and what its padding was.
+struct InstallLayoutCore {
+  size_t insts_payload;      // ELF text size plus the runtime prolog reserve
+  size_t consts_payload;     // exact size from ConstSectionPlan, or legacy 48 KiB
+  size_t stubs_payload;      // unchanged conservative estimate
+  size_t locs_payload;       // unchanged conservative estimate
+  size_t code_size_input;    // first argument of CodeBuffer::initialize(...)
+  bool   used_legacy_fallback;
+  // diagnostics
+  size_t planned_padding;    // bytes of inter-section padding inside consts
+  size_t planned_alignment;  // max_alignment requested from the planner
+  size_t planned_entries;    // number of planned const sections
+  const char* plan_status;   // ConstPlanStatus name
+
+  InstallLayoutCore()
+    : insts_payload(0), consts_payload(0), stubs_payload(0), locs_payload(0),
+      code_size_input(0), used_legacy_fallback(true), planned_padding(0),
+      planned_alignment(0), planned_entries(0), plan_status("Unplanned") {}
+};
+
+// Pre-Week-5 allocation constants. These are reproduced verbatim so that the
+// legacy fallback path is bit-for-bit the old behaviour, and so that a reader
+// can diff the two strategies without archeology.
+static const size_t LEGACY_CONSTS_SIZE   = 6144 * wordSize;  // 48 KiB on RISCV64
+static const size_t LEGACY_STUBS_SIZE    = 160;
+static const size_t INSTS_PROLOG_RESERVE = 2048;                 // "for prolog"
+
 class JeandleCompiledCode : public StackObj {
  public:
+  // Defined in the .cpp: records CodeBuffer telemetry once per finalize() call,
+  // on every exit path. Needs access to record_finalize_telemetry().
+  friend class FinalizeTelemetry;
+
   // For compiled Java methods.
   JeandleCompiledCode(ciEnv* env,
                       ciMethod* method,
@@ -190,7 +226,17 @@ class JeandleCompiledCode : public StackObj {
                       _code_buffer("JeandleCompiledCode"),
                       _routine_call_sites(),
                       _non_routine_call_sites(),
+                      _const_section_addrs_by_index(),
                       _const_sections(),
+                      _const_plan(),
+                      _used_const_layout_fallback(false),
+                      _layout_fallback_count(0),
+                      _used_exact_allocation(false),
+                      _planned_padding(0),
+                      _planned_alignment(0),
+                      _planned_entries(0),
+                      _planned_consts_size(-1),
+                      _plan_status("Unplanned"),
                       _oop_handles(),
                       _oop_handle_ids(),
                       _oop_handle_info(),
@@ -215,7 +261,17 @@ class JeandleCompiledCode : public StackObj {
                       _code_buffer("JeandleCompiledStub"),
                       _routine_call_sites(),
                       _non_routine_call_sites(),
+                      _const_section_addrs_by_index(),
                       _const_sections(),
+                      _const_plan(),
+                      _used_const_layout_fallback(false),
+                      _layout_fallback_count(0),
+                      _used_exact_allocation(false),
+                      _planned_padding(0),
+                      _planned_alignment(0),
+                      _planned_entries(0),
+                      _planned_consts_size(-1),
+                      _plan_status("Unplanned"),
                       _oop_handles(),
                       _oop_handle_ids(),
                       _oop_handle_info(),
@@ -232,6 +288,8 @@ class JeandleCompiledCode : public StackObj {
                       _orig_pc_offset_in_bytes(-1),
                       _interpreter_frame_size_in_bytes(0),
                       _has_method_handle_invoke(false) {}
+
+  const ConstSectionPlan& const_plan() const { return _const_plan; }
 
   void install_obj(std::unique_ptr<ObjectBuffer> obj);
 
@@ -311,7 +369,18 @@ class JeandleCompiledCode : public StackObj {
   llvm::SmallVector<CallSiteInfo*> _non_routine_call_sites; // Contains all other call sites,
                                                             // constructed during LLVM IR generation.
 
+  llvm::DenseMap<uint32_t, address> _const_section_addrs_by_index;
   llvm::StringMap<address> _const_sections;
+  ConstSectionPlan _const_plan;
+  bool _used_const_layout_fallback;
+  // Week 5 telemetry for one finalize() invocation.
+  int _layout_fallback_count;   // unplanned const sections discovered at runtime
+  bool _used_exact_allocation;  // consts capacity came from the plan
+  size_t _planned_padding;
+  size_t _planned_alignment;
+  size_t _planned_entries;
+  int64_t _planned_consts_size; // -1 when the planner was not used
+  const char* _plan_status;
 
   // Oop handles maintainer:
   llvm::StringMap<jobject> _oop_handles;                // name -> jobject
@@ -340,8 +409,21 @@ class JeandleCompiledCode : public StackObj {
                         llvm::SmallVector<JeandleReloc*>& relocs,
                         llvm::jitlink::LinkGraph* link_graph);
 
-  // Lookup address of const section in CodeBuffer.
+  // Week 5: decide every allocation-relevant quantity before any section size
+  // has been requested from the CodeBuffer. See the .cpp for why this has to
+  // happen before initialize().
+  void decide_install_layout(uint64_t elf_text_size, InstallLayoutCore& layout);
+
+  // Records allocate/expand/finalize telemetry for this compilation.
+  void record_finalize_telemetry(jlong elapsed_us);
+
+  // Week 4: Centralized emission of planned const sections.
+  void emit_planned_const_sections(JeandleAssembler& assembler);
+
+  // Lookup address of const section in CodeBuffer (index is canonical primary identity).
+  address lookup_const_section(uint32_t section_index, JeandleAssembler& assembler);
   address lookup_const_section(llvm::StringRef name, JeandleAssembler& assembler);
+  address lookup_const_section_fallback(llvm::StringRef name, JeandleAssembler& assembler);
   address resolve_const_reloc_site(LinkBlock& block, LinkEdge& edge, JeandleAssembler& assembler);
   address resolve_const_edge(LinkBlock& block, LinkEdge& edge, JeandleAssembler& assembler);
 
