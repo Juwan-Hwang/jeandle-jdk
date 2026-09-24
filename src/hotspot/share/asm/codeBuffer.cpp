@@ -884,7 +884,6 @@ csize_t CodeBuffer::figure_expanded_capacities(CodeSection* which_cs,
 }
 
 void CodeBuffer::expand(CodeSection* which_cs, csize_t amount) {
-  CodeBufferTimer expand_timer;
 
 #ifndef PRODUCT
   if (PrintNMethods && (WizardMode || Verbose)) {
@@ -915,7 +914,12 @@ void CodeBuffer::expand(CodeSection* which_cs, csize_t amount) {
     = figure_expanded_capacities(which_cs, amount, new_capacity);
 
   if (CodeBufferInstrumentation::enabled()) {
-    int sect = (int)(which_cs - &_consts);
+    // Declared here rather than at the top of expand(): with the instrumentation off
+    // this path must cost nothing. Index by explicit comparison - deriving it from the
+    // address difference of CodeBuffer members worked only because _consts, _insts and
+    // _stubs happen to be adjacent, and would break silently if they ever move apart.
+    CodeBufferTimer expand_timer;
+    const int sect = (which_cs == &_consts) ? 0 : ((which_cs == &_insts) ? 1 : 2);
     CodeBufferInstrumentation::instance()->record_expand(this, sect, amount, new_total_cap, expand_timer.elapsed_us());
   }
 
