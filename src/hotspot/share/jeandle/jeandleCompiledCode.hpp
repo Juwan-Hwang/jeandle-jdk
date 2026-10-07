@@ -192,6 +192,9 @@ struct InstallLayoutCore {
   size_t locs_payload;       // unchanged conservative estimate
   size_t code_size_input;    // first argument of CodeBuffer::initialize(...)
   bool   used_legacy_fallback;
+  // Week 7: exact insts planning
+  size_t planned_prolog;     // condition-sensitive prolog upper bound
+  size_t planned_post_stubs; // out-of-line insts stubs bound
   // diagnostics
   size_t planned_padding;    // bytes of inter-section padding inside consts
   size_t planned_alignment;  // max_alignment requested from the planner
@@ -200,8 +203,8 @@ struct InstallLayoutCore {
 
   InstallLayoutCore()
     : insts_payload(0), consts_payload(0), stubs_payload(0), locs_payload(0),
-      code_size_input(0), used_legacy_fallback(true), planned_padding(0),
-      planned_alignment(0), planned_entries(0), plan_status("Unplanned") {}
+      code_size_input(0), used_legacy_fallback(true), planned_prolog(0), planned_post_stubs(0),
+      planned_padding(0), planned_alignment(0), planned_entries(0), plan_status("Unplanned") {}
 };
 
 // Pre-Week-5 allocation constants. These are reproduced verbatim so that the
@@ -409,10 +412,14 @@ class JeandleCompiledCode : public StackObj {
                         llvm::SmallVector<JeandleReloc*>& relocs,
                         llvm::jitlink::LinkGraph* link_graph);
 
-  // Week 5: decide every allocation-relevant quantity before any section size
+  // Week 5 & 7: decide every allocation-relevant quantity before any section size
   // has been requested from the CodeBuffer. See the .cpp for why this has to
   // happen before initialize().
-  void decide_install_layout(uint64_t elf_text_size, InstallLayoutCore& layout);
+  void decide_install_layout(uint64_t elf_text_size, uint64_t func_align, InstallLayoutCore& layout);
+
+  // Week 7: exact upper bound estimators for insts section
+  size_t prolog_upper_bound(uint64_t func_align);
+  size_t post_insts_stubs_upper_bound();
 
   // Records allocate/expand/finalize telemetry for this compilation.
   void record_finalize_telemetry(jlong elapsed_us);
