@@ -374,3 +374,59 @@ int JeandleAssembler::trampoline_call_stub_upper_bound() {
   // max_trampoline_stub_size() = NativeFarJump::instruction_size (13 bytes, bounded by 16)
   return 16;
 }
+
+// ---------------------------------------------------------------------------
+// Week 9: relocation record census for this architecture
+// ---------------------------------------------------------------------------
+//
+// x86_64 has no `far_branches()`: a pc-relative call or jump reaches the whole code cache
+// as long as the cache stays inside the 2 GiB displacement of a rel32, which the assert in
+// MacroAssembler::call(const AddressLiteral&) checks. So Jeandle routes a call through a
+// trampoline stub only where it has to - the external call sites, which use
+// MacroAssembler::trampoline_call(AddressLiteral) unconditionally (see
+// patch_external_call_site() above). That trampoline records its owning call site, hence
+// one trampoline_stub record per external call and, because the call site itself is
+// patched with `relocInfo::none`, no record in insts for it.
+bool JeandleAssembler::needs_trampoline_branches() {
+  return false;
+}
+
+bool JeandleAssembler::shares_runtime_call_trampolines() {
+  // Not about CodeBuffer::supports_shared_stubs() (which is true on x86_64 as well): this
+  // is about Jeandle's own patching path. patch_routine_call_site() emits
+  // `call(AddressLiteral(target, relocInfo::runtime_call_type))` directly, so a runtime
+  // call never asks for a trampoline here and none is shared.
+  return false;
+}
+
+bool JeandleAssembler::entry_barrier_calls_runtime_stub() {
+  // JeandleEntryBarrierStub::emit() above: `call(RuntimeAddress(method_entry_barrier))`,
+  // which relocates the call site with runtime_call_type.
+  return true;
+}
+
+bool JeandleAssembler::static_call_stub_has_metadata_record() {
+  // emit_static_call_stub() above ends with __ mov_metadata(rbx, nullptr), which
+  // relocates the immediate with metadata_type (macroAssembler_x86.cpp).
+  return true;
+}
+
+bool JeandleAssembler::static_call_stub_has_runtime_call_record() {
+  // ... and with __ jump(RuntimeAddress(__ pc())), whose RuntimeAddress rspec relocates too.
+  return true;
+}
+
+// The three jeandle relocation types are packed by the generic implementations here:
+// relocInfo_x86.cpp's pd_pack_data_to() returns false for all of them, so the record
+// payload is what the base class writes - pack_2_ints_to(), at most 4 halfwords.
+int JeandleAssembler::reloc_record_data_halfwords(relocInfo::relocType type) {
+  switch (type) {
+    case relocInfo::jeandle_oop_type:        // oop_Relocation: index + offset
+    case relocInfo::jeandle_oop_addr_type:   // oop_Relocation: index + offset
+    case relocInfo::jeandle_section_word_type: // compressed target + addend
+      return 4;
+    default:
+      ShouldNotReachHere();
+      return 0;
+  }
+}

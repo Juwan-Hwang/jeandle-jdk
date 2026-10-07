@@ -6,6 +6,52 @@
 #include "utilities/ostream.hpp"
 #include "runtime/os.hpp"
 
+// Week 9: the locs census is read straight off the CodeBuffer, so this file needs the
+// full definitions. codeBuffer.hpp includes this header, which is fine here (a .cpp may
+// depend in both directions; a header must not).
+#ifndef PRODUCT
+#include "asm/codeBuffer.hpp"
+#include "code/relocInfo.hpp"
+
+// relocInfo type names, in the order of relocInfo::relocType. Kept next to the census so
+// a histogram row can never be printed with the wrong label.
+const char* const codebuffer_reloc_type_names[] = {
+  "none",
+  "oop",
+  "virtual_call",
+  "opt_virtual_call",
+  "static_call",
+  "static_stub",
+  "runtime_call",
+  "external_word",
+  "internal_word",
+  "section_word",
+  "poll",
+  "poll_return",
+  "metadata",
+  "trampoline_stub",
+  "runtime_call_w_cp",
+  "data_prefix_tag",
+  "post_call_nop",
+  "entry_guard",
+  "barrier",
+  "jeandle_section_word",
+  "jeandle_oop",
+  "jeandle_oop_addr",
+};
+const int codebuffer_reloc_type_name_count =
+    (int)(sizeof(codebuffer_reloc_type_names) / sizeof(codebuffer_reloc_type_names[0]));
+
+// Guards the table above against an upstream relocInfo change: if a type is inserted or
+// renamed, this fires on the first census read instead of silently mislabelling rows.
+static const char* reloc_type_name(int kind) {
+  if (kind < 0 || kind >= codebuffer_reloc_type_name_count) {
+    return "unknown";
+  }
+  return codebuffer_reloc_type_names[kind];
+}
+#endif // PRODUCT
+
 std::atomic<CodeBufferInstrumentation*> CodeBufferInstrumentation::_instance(nullptr);
 
 // ---- ConstLayoutStats ----
@@ -16,6 +62,7 @@ volatile jint  ConstLayoutStats::_legacy_path            = 0;
 volatile jint  ConstLayoutStats::_plan_failures          = 0;
 volatile jint  ConstLayoutStats::_fallback_triggered     = 0;
 volatile jint  ConstLayoutStats::_const_expand_after_plan = 0;
+volatile jint  ConstLayoutStats::_locs_expand_after_plan   = 0;
 volatile jlong ConstLayoutStats::_exact_consts_bytes     = 0;
 volatile jlong ConstLayoutStats::_legacy_consts_bytes    = 0;
 
@@ -26,6 +73,7 @@ void ConstLayoutStats::reset() {
   Atomic::store(&_plan_failures, (jint)0);
   Atomic::store(&_fallback_triggered, (jint)0);
   Atomic::store(&_const_expand_after_plan, (jint)0);
+  Atomic::store(&_locs_expand_after_plan, (jint)0);
   Atomic::store(&_exact_consts_bytes, (jlong)0);
   Atomic::store(&_legacy_consts_bytes, (jlong)0);
 }
@@ -40,6 +88,7 @@ void ConstLayoutStats::print_on(outputStream* st) {
   st->print_cr("  Planner failures:                     %d", plan_failures());
   st->print_cr("  Runtime layout fallbacks:             %d", fallback_triggered());
   st->print_cr("  consts expansions after exact plan:   %d", const_expand_after_plan());
+  st->print_cr("  locs expansions after exact plan:     %d", locs_expand_after_plan());
   st->print_cr("  Consts bytes requested by planner:    " JLONG_FORMAT, exact);
   st->print_cr("  Consts bytes legacy would request:    " JLONG_FORMAT, legacy);
   if (legacy > 0) {
@@ -232,6 +281,51 @@ void CodeBufferInstrumentation::record_finalize(const CodeBuffer* cb,
   r->_layout_fallback_count = layout_fallback_count;
 }
 
+void CodeBufferInstrumentation::record_locs(const CodeBuffer* cb, const int* planned_bytes) {
+  if (!enabled()) return;
+#ifndef PRODUCT
+  // The census lives in the buffer, so a compilation is reported while its CodeBuffer is
+  // still alive - the same lifetime rule that record_finalize() relies on.
+  assert((int)CodeBuffer::SECT_LIMIT == (int)locs_sections, "section count drifted");
+  assert(CodeBuffer::reloc_kind_count() <= (int)reloc_kind_max, "reloc type table too small");
+  assert(codebuffer_reloc_type_name_count == (int)relocInfo::jeandle_oop_addr_type + 1,
+         "reloc type name table drifted");
+
+  Record* fresh = new Record("unknown", 0, 0, 0, 0);
+  fresh->_buffer = cb;
+  CodeBufferInstrumentation* inst = instance();
+  Record* r;
+  {
+    MutexLocker ml(&inst->_lock, Mutex::_no_safepoint_check_flag);
+    r = inst->find_locked(cb);
+    if (r == nullptr) {
+      r = fresh;
+      inst->_records.append(r);
+      fresh = nullptr;
+    }
+  }
+  if (fresh != nullptr) {
+    delete fresh;
+  }
+
+  for (int sec = 0; sec < (int)locs_sections; sec++) {
+    const CodeSection* cs = cb->code_section(sec);
+    r->_locs_planned_bytes[sec] = (planned_bytes != nullptr) ? planned_bytes[sec] : -1;
+    r->_locs_initial_elements[sec] = cb->locs_initial_capacity(sec);
+    r->_locs_used_elements[sec]    = cs->has_locs() ? cs->locs_count() : 0;
+    r->_locs_final_elements[sec]   = cs->has_locs() ? cs->locs_capacity() : 0;
+    r->_locs_expansions[sec]       = cb->locs_expand_count(sec);
+    r->_locs_expand_bytes[sec]     = cb->locs_expand_bytes(sec);
+    r->_locs_gap_fillers[sec]      = cb->locs_gap_fillers(sec);
+    r->_locs_unstored[sec]         = cb->locs_unstored_relocs(sec);
+    for (int k = 0; k < (int)reloc_kind_max; k++) {
+      r->_reloc_records[sec][k]  = cb->reloc_records(sec, k);
+      r->_reloc_elements[sec][k] = cb->reloc_elements(sec, k);
+    }
+  }
+#endif // PRODUCT
+}
+
 CodeBufferInstrumentation::Summary CodeBufferInstrumentation::compute_summary() const {
   Summary s = {};
   s.max_latency = -1;
@@ -277,6 +371,36 @@ CodeBufferInstrumentation::Summary CodeBufferInstrumentation::compute_summary() 
       else                      s.stubs_expands++;
     }
 
+    // Week 9: the second growth path. Only finalized records describe a compilation that
+    // happened, so the census of a temporary CodeBuffer is counted nowhere but here.
+    if (r->_finalized) {
+      int record_expansions = 0;
+      for (int sec = 0; sec < (int)locs_sections; sec++) {
+        s.locs_expansions    += r->_locs_expansions[sec];
+        s.locs_expand_bytes  += r->_locs_expand_bytes[sec];
+        s.locs_used_elements += r->_locs_used_elements[sec];
+        s.locs_capacity_elements += r->_locs_final_elements[sec];
+        s.locs_gap_fillers   += r->_locs_gap_fillers[sec];
+        s.locs_unstored      += r->_locs_unstored[sec];
+        record_expansions    += r->_locs_expansions[sec];
+        if (r->_locs_planned_bytes[sec] >= 0) {
+          s.locs_planned_bytes += r->_locs_planned_bytes[sec];
+        }
+        for (int k = 0; k < (int)reloc_kind_max; k++) {
+          s.reloc_kind_records[k]  += r->_reloc_records[sec][k];
+          s.reloc_kind_elements[k] += r->_reloc_elements[sec][k];
+          s.reloc_records_total    += r->_reloc_records[sec][k];
+          s.reloc_elements_total   += r->_reloc_elements[sec][k];
+        }
+      }
+      if (record_expansions > 0) {
+        s.records_with_locs_expansion++;
+      }
+      if (r->_locs_planned_bytes[1] >= 0) {
+        s.records_with_exact_locs++;
+      }
+    }
+
     s.total_latency += r->_finalize_latency_us;
     if (r->_finalize_latency_us > s.max_latency) {
       s.max_latency = r->_finalize_latency_us;
@@ -317,6 +441,38 @@ void CodeBufferInstrumentation::output_json() {
   fprintf(fp, "      \"stubs\": %d,\n", s.stubs_expands);
   fprintf(fp, "      \"total_bytes\": %d\n", s.total_expand_bytes);
   fprintf(fp, "    },\n");
+  // Week 9: the relocation array has its own growth path (CodeSection::expand_locs),
+  // separate from the CodeCache-level expansion above. Elements are relocInfo slots.
+  fprintf(fp, "    \"locs\": {\n");
+  fprintf(fp, "      \"unit\": \"relocInfo elements (2 bytes each) unless suffixed _bytes\",\n");
+  fprintf(fp, "      \"expansions\": %d,\n", s.locs_expansions);
+  fprintf(fp, "      \"expansion_bytes\": %d,\n", s.locs_expand_bytes);
+  fprintf(fp, "      \"used_elements\": %d,\n", s.locs_used_elements);
+  fprintf(fp, "      \"capacity_elements\": %d,\n", s.locs_capacity_elements);
+  fprintf(fp, "      \"planned_bytes\": %d,\n", s.locs_planned_bytes);
+  fprintf(fp, "      \"gap_fillers\": %d,\n", s.locs_gap_fillers);
+  fprintf(fp, "      \"unstored_relocs\": %d,\n", s.locs_unstored);
+  fprintf(fp, "      \"records_with_expansion\": %d,\n", s.records_with_locs_expansion);
+  fprintf(fp, "      \"records_with_exact_plan\": %d\n", s.records_with_exact_locs);
+  fprintf(fp, "    },\n");
+  fprintf(fp, "    \"reloc_total_records\": %d,\n", s.reloc_records_total);
+  fprintf(fp, "    \"reloc_total_elements\": %d,\n", s.reloc_elements_total);
+#ifndef PRODUCT
+  fprintf(fp, "    \"reloc_distribution\": [\n");
+  // One row per relocInfo type that any finalized compilation actually received.
+  bool first_kind = true;
+  for (int k = 0; k < (int)reloc_kind_max; k++) {
+    if (s.reloc_kind_records[k] == 0) {
+      continue;
+    }
+    fprintf(fp, "      %s{\"kind\": \"%s\", \"records\": %d, \"elements\": %d, \"mean_elements\": %.3f}",
+            first_kind ? "" : ",\n      ", reloc_type_name(k),
+            s.reloc_kind_records[k], s.reloc_kind_elements[k],
+            (double)s.reloc_kind_elements[k] / (double)s.reloc_kind_records[k]);
+    first_kind = false;
+  }
+  fprintf(fp, "%s\n    ],\n", first_kind ? "" : "");
+#endif // PRODUCT
   fprintf(fp, "    \"consts_usage_bytes\": %d,\n", s.consts_usage);
   fprintf(fp, "    \"consts_capacity_bytes\": %d,\n", s.consts_capacity);
   fprintf(fp, "    \"planned_consts_bytes\": %d,\n", s.planned_size_sum);
@@ -373,6 +529,26 @@ void CodeBufferInstrumentation::output_json() {
     fprintf(fp, "        \"insts_size\": %d,\n", r->_final_insts_size);
     fprintf(fp, "        \"stubs_size\": %d\n", r->_final_stubs_size);
     fprintf(fp, "      },\n");
+    // Week 9: per-section relocation array census. planned_bytes < 0 means the locs model
+    // did not size this section (legacy heuristic, or the whole buffer took the fallback).
+    static const char* const locs_section_names[locs_sections] = { "consts", "insts", "stubs" };
+    fprintf(fp, "      \"locs\": {\n");
+    for (int sec = 0; sec < (int)locs_sections; sec++) {
+      int records = 0;
+      int elements = 0;
+      for (int k = 0; k < (int)reloc_kind_max; k++) {
+        records  += r->_reloc_records[sec][k];
+        elements += r->_reloc_elements[sec][k];
+      }
+      fprintf(fp, "        \"%s\": {\"planned_bytes\": %d, \"initial_elements\": %d, \"used_elements\": %d, \"capacity_elements\": %d, \"expansions\": %d, \"expansion_bytes\": %d, \"gap_fillers\": %d, \"unstored_relocs\": %d, \"records\": %d, \"elements\": %d}%s\n",
+              locs_section_names[sec], r->_locs_planned_bytes[sec],
+              r->_locs_initial_elements[sec], r->_locs_used_elements[sec],
+              r->_locs_final_elements[sec], r->_locs_expansions[sec],
+              r->_locs_expand_bytes[sec], r->_locs_gap_fillers[sec],
+              r->_locs_unstored[sec], records, elements,
+              (sec < (int)locs_sections - 1) ? "," : "");
+    }
+    fprintf(fp, "      },\n");
     fprintf(fp, "      \"finalize_latency_us\": " JLONG_FORMAT "\n", r->_finalize_latency_us);
     fprintf(fp, "    }%s\n", (i < _records.length() - 1) ? "," : "");
   }
@@ -391,6 +567,15 @@ void CodeBufferInstrumentation::output_json() {
   tty->print_cr("  Expand: total %d (consts %d, insts %d, stubs %d), bytes %d",
                 s.total_expands, s.consts_expands, s.insts_expands, s.stubs_expands,
                 s.total_expand_bytes);
+  tty->print_cr("  Locs expand (separate growth path): %d reallocations, %d bytes added,"
+                " %d records affected",
+                s.locs_expansions, s.locs_expand_bytes,
+                s.records_with_locs_expansion);
+  tty->print_cr("  Relocs: %d records / %d elements, gap fillers %d, unstored %d",
+                s.reloc_records_total, s.reloc_elements_total,
+                s.locs_gap_fillers, s.locs_unstored);
+  tty->print_cr("  Locs elements: used %d / capacity %d (planned %d bytes)",
+                s.locs_used_elements, s.locs_capacity_elements, s.locs_planned_bytes);
   tty->print_cr("  Consts: usage %d bytes / capacity %d bytes, waste %.2f%%",
                 s.consts_usage, s.consts_capacity,
                 s.consts_capacity > 0

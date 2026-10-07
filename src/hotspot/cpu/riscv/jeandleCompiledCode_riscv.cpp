@@ -219,3 +219,58 @@ bool JeandleCompiledCode::pd_resolve_reloc(JeandleAssembler& assembler,
   }
   return true;
 }
+
+// Week 9: the RISC-V half of the relocation census.
+//
+// It has to sit next to pd_resolve_reloc() rather than in the shared walker, because
+// RISC-V does not classify an edge from the edge alone: an R_RISCV_PCREL_LO12_I edge is
+// only understood through the HI20 edge it refers to, and both halves of such a pair
+// become a relocation record of their own. Copying that rule here means the census and the
+// resolver cannot disagree about how many records an object produces without that being
+// visible in one screen of source.
+bool JeandleCompiledCode::pd_collect_call_site_census(llvm::jitlink::LinkGraph* link_graph,
+                                                      JeandleCallSiteCensus& census) {
+  llvm::DenseMap<std::pair<LinkBlock*, llvm::orc::ExecutorAddrDiff>, LinkEdge*> rel_high_edges;
+
+  for (auto* block : link_graph->blocks()) {
+    for (auto& edge : block->edges()) {
+      if (edge.getKind() == llvm::jitlink::riscv::EdgeKind_riscv::R_RISCV_PCREL_HI20) {
+        rel_high_edges[{block, edge.getOffset()}] = &edge;
+      }
+    }
+  }
+
+  for (auto* block : link_graph->blocks()) {
+    const llvm::StringRef block_name = block->getSection().getName();
+    // The resolver's own filter: RISC-V walks .text and .rodata blocks only.
+    if (block_name.compare(".text") != 0 && !block_name.starts_with(".rodata")) {
+      continue;
+    }
+    for (auto& edge : block->edges()) {
+      auto& target = edge.getTarget();
+      if (JeandleAssembler::is_routine_call_reloc(target, edge.getKind())) {
+        census._routine_call_sites++;
+      } else if (JeandleAssembler::is_external_call_reloc(target, edge.getKind())) {
+        census._external_call_sites++;
+      } else if (JeandleAssembler::is_section_word_reloc(edge, rel_high_edges)) {
+        // Which section carries the record, in the resolver's three cases: a reference
+        // from code to a constant (or to another part of code) is relocated in insts; a
+        // constant pointing at code, or at another constant through ADD32/SUB32, in consts.
+        if (block_name.compare(".text") == 0 &&
+            (target.getSection().getName().compare(".text") == 0 ||
+             target.getSection().getName().starts_with(".rodata"))) {
+          census._section_word_insts++;
+        } else {
+          census._section_word_consts++;
+        }
+      } else if (JeandleAssembler::is_oop_reloc(edge, rel_high_edges)) {
+        census._oop_relocs++;
+      } else if (JeandleAssembler::is_oop_addr_reloc(edge, rel_high_edges)) {
+        census._oop_addr_relocs++;
+      } else {
+        census._unclassified_edges++;
+      }
+    }
+  }
+  return true;
+}

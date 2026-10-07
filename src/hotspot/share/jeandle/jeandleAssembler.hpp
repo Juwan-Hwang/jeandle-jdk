@@ -112,6 +112,30 @@ class JeandleAssembler : public StackObj {
   static int static_call_stub_upper_bound();
   static int trampoline_call_stub_upper_bound();
 
+  // Week 9: halfwords that <type>_Relocation::pack_data_to() writes for Jeandle's own
+  // relocation types, i.e. how much payload one record of that type costs in the locs
+  // array. The encodings live in relocInfo_<cpu>.cpp, so this count belongs next to them
+  // and is asked from the architecture rather than guessed centrally.
+  static int reloc_record_data_halfwords(relocInfo::relocType type);
+
+  // Week 9: whether this build routes calls through trampoline stubs, and whether runtime
+  // routine calls share them. Both decide how many records the stubs section receives.
+  static bool needs_trampoline_branches();
+  static bool shares_runtime_call_trampolines();
+
+  // Week 9: whether the deferred nmethod entry barrier stub reaches its runtime routine
+  // through a pc-relative call (which relocates) or by loading an address into a register
+  // (which does not).
+  static bool entry_barrier_calls_runtime_stub();
+
+  // Week 9: which relocation records the body of one static-call stub emits, on top of the
+  // static_stub record that JeandleAssembler::emit_static_call_stub() writes explicitly.
+  // Every architecture loads a method oop into a register there (a metadata record); x86_64
+  // additionally ends the stub with a jump through a RuntimeAddress (a runtime_call record),
+  // while RISC-V and AArch64 build the target address without relocating.
+  static bool static_call_stub_has_metadata_record();
+  static bool static_call_stub_has_runtime_call_record();
+
  private:
   MacroAssembler* _masm;
 

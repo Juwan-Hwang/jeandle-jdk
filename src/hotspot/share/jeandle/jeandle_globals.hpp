@@ -98,6 +98,25 @@
   develop(bool, JeandleForceConstPlanFallback, false,                       \
           "Force the const section planner to fail so that the legacy "     \
           "6144*wordSize consts reservation is exercised (testing only).")  \
+                                                                            \
+  product(bool, JeandleExactLocs, true,                                     \
+          "Size each CodeBuffer relocation array (locs) from the Jeandle "  \
+          "relocation record model instead of HotSpot's fixed heuristic. "  \
+          "Turn off to A/B the legacy provisioning, which grows the array " \
+          "by repeated CodeSection::expand_locs() reallocations.")          \
+                                                                            \
+  develop(bool, JeandleTraceRelocRecords, false,                            \
+          "Print one line per compiled method with its relocation record "  \
+          "census by relocInfo type and section.")                          \
+                                                                            \
+  develop(bool, JeandleTraceRelocSteps, false,                              \
+          "Print every CodeSection::relocate() step of a Jeandle compilation "\
+          "with type, address and element cost. Meant for one targeted method: "\
+          "on a whole run it is far too loud.")                             \
+                                                                            \
+  develop(ccstr, JeandleTraceRelocMethod, nullptr,                          \
+          "Function name of the method whose relocate() steps "             \
+          "-XX:+JeandleTraceRelocSteps should follow.")                     \
                                                                             // end of JEANDLE_FLAGS
 
 DECLARE_FLAGS(JEANDLE_FLAGS)

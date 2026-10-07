@@ -12,6 +12,16 @@ class outputStream;
 class CodeBuffer;   // records are keyed by buffer identity
 
 class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
+ public:
+  // Number of CodeBuffer sections (consts, insts, stubs) and of relocInfo types the
+  // census can report. Both are mirrored here because this header must not depend on
+  // codeBuffer.hpp (which includes this file). The .cpp checks the values at the first
+  // use, so a drift upstream cannot silently truncate a histogram.
+  enum {
+    locs_sections   = 3,
+    reloc_kind_max  = 32
+  };
+
  private:
   struct ExpansionEvent {
     int  _section;        // SECT_CONSTS=0, SECT_INSTS=1, SECT_STUBS=2
@@ -60,6 +70,21 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
     const char* _plan_status;      // ConstSectionPlan::status_name()
     bool _used_exact_allocation;   // consts capacity came from the plan, not the 48 KiB default
     int  _layout_fallback_count;   // runtime discovery of an unplanned const section
+    // Week 9: relocation array (locs) census, one entry per section, in CodeBuffer
+    // section order. CodeBuffer::expand() (CodeCache growth) and CodeSection::expand_locs()
+    // (a ResourceArea realloc on the relocation array) are two different growth paths; the
+    // fields above only ever covered the first one. These are the second.
+    // _locs_planned_bytes[n] < 0 means the locs model did not size that section.
+    int  _locs_planned_bytes[locs_sections];   // model prediction, bytes
+    int  _locs_initial_elements[locs_sections];// slots allocated by initialize_locs()
+    int  _locs_used_elements[locs_sections];   // slots in use at the end of finalize()
+    int  _locs_final_elements[locs_sections];  // slot capacity at the end of finalize()
+    int  _locs_expansions[locs_sections];      // expand_locs() reallocations
+    int  _locs_expand_bytes[locs_sections];    // slots those reallocs added, in bytes
+    int  _locs_gap_fillers[locs_sections];     // filler records spanning large offsets
+    int  _locs_unstored[locs_sections];        // relocate() calls with no locs storage
+    int  _reloc_records[locs_sections][reloc_kind_max];   // records by section and type
+    int  _reloc_elements[locs_sections][reloc_kind_max];  // elements consumed by those
 
     Record(const char* name, int code_size, int consts_cap,
            int stubs_size, int locs_size)
@@ -70,7 +95,22 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
         _final_stubs_size(0), _final_consts_capacity(0), _finalize_latency_us(0),
         _planned_consts_size(-1), _planned_padding(0), _planned_alignment(0),
         _const_entries(0), _plan_status("Unplanned"),
-        _used_exact_allocation(false), _layout_fallback_count(0) {}
+        _used_exact_allocation(false), _layout_fallback_count(0) {
+      for (int s = 0; s < (int)locs_sections; s++) {
+        _locs_planned_bytes[s]  = -1;
+        _locs_initial_elements[s] = 0;
+        _locs_used_elements[s]  = 0;
+        _locs_final_elements[s] = 0;
+        _locs_expansions[s]     = 0;
+        _locs_expand_bytes[s]   = 0;
+        _locs_gap_fillers[s]    = 0;
+        _locs_unstored[s]       = 0;
+        for (int k = 0; k < (int)reloc_kind_max; k++) {
+          _reloc_records[s][k]  = 0;
+          _reloc_elements[s][k] = 0;
+        }
+      }
+    }
 
     // Computed metrics
     int consts_slack() const { return _final_consts_capacity - _final_consts_size; }
@@ -121,6 +161,20 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
     int planned_size_sum;
     jlong total_latency;
     jlong max_latency;
+    // Week 9: locs / relocation census aggregates over finalized records only.
+    int locs_expansions;
+    int locs_expand_bytes;
+    int locs_used_elements;
+    int locs_capacity_elements;
+    int locs_planned_bytes;
+    int locs_gap_fillers;
+    int locs_unstored;
+    int records_with_locs_expansion;
+    int records_with_exact_locs;
+    int reloc_records_total;
+    int reloc_elements_total;
+    int reloc_kind_records[reloc_kind_max];
+    int reloc_kind_elements[reloc_kind_max];
   };
 
   Summary compute_summary() const;
@@ -163,6 +217,12 @@ class CodeBufferInstrumentation : public CHeapObj<mtCompiler> {
                        const char* plan_status, bool used_exact_allocation,
                        int layout_fallback_count);
 
+  // Week 9: pull the locs and relocation census out of a buffer whose compilation is
+  // being reported. `planned_bytes` holds one entry per section, or is nullptr when the
+  // locs model did not size this buffer (legacy path). Reads only: the census itself is
+  // maintained by CodeBuffer/CodeSection without a lock.
+  void record_locs(const CodeBuffer* cb, const int* planned_bytes);
+
   static void output_and_shutdown();
 
  private:
@@ -184,7 +244,11 @@ class ConstLayoutStats : public AllStatic {
   static volatile jint _legacy_path;         // allocated with the 48 KiB default
   static volatile jint _plan_failures;       // planner refused to produce a layout
   static volatile jint _fallback_triggered;  // runtime discovery of an unplanned section
-  static volatile jint _const_expand_after_plan; // consts expanded despite exact allocation
+  static volatile jint  _const_expand_after_plan; // consts expanded despite exact allocation
+  // Week 9: the same question for the relocation array. A locs expansion is not a
+  // correctness failure - CodeSection::relocate() simply grows the array - so it is
+  // reported as a count and never asserted on.
+  static volatile jint  _locs_expand_after_plan;
   static volatile jlong _exact_consts_bytes;  // consts bytes handed out by the planner
   static volatile jlong _legacy_consts_bytes; // consts bytes that legacy would have used
 
@@ -208,6 +272,9 @@ class ConstLayoutStats : public AllStatic {
   static void record_const_expand_after_plan() {
     Atomic::add(&_const_expand_after_plan, (jint)1);
   }
+  static void record_locs_expand_after_plan() {
+    Atomic::add(&_locs_expand_after_plan, (jint)1);
+  }
 
   static int  methods_seen()               { return Atomic::load(&_methods_seen); }
   static int  exact_path()                 { return Atomic::load(&_exact_path); }
@@ -215,6 +282,7 @@ class ConstLayoutStats : public AllStatic {
   static int  plan_failures()              { return Atomic::load(&_plan_failures); }
   static int  fallback_triggered()         { return Atomic::load(&_fallback_triggered); }
   static int  const_expand_after_plan()    { return Atomic::load(&_const_expand_after_plan); }
+  static int  locs_expand_after_plan()     { return Atomic::load(&_locs_expand_after_plan); }
   static jlong exact_consts_bytes()        { return Atomic::load(&_exact_consts_bytes); }
   static jlong legacy_consts_bytes()       { return Atomic::load(&_legacy_consts_bytes); }
 

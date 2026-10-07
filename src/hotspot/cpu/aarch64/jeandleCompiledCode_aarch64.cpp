@@ -47,3 +47,11 @@ bool JeandleCompiledCode::pd_resolve_reloc(JeandleAssembler& assembler,
                                            llvm::jitlink::LinkGraph* link_graph) {
   return false;
 }
+
+bool JeandleCompiledCode::pd_collect_call_site_census(llvm::jitlink::LinkGraph* link_graph,
+                                                      JeandleCallSiteCensus& census) {
+  // AArch64 resolves each edge from its own symbol and kind, exactly like x86_64, so the
+  // generic walk in JeandleCompiledCode::collect_call_site_census() is used - the same
+  // walk resolve_reloc_info() performs when pd_resolve_reloc() declines.
+  return false;
+}
