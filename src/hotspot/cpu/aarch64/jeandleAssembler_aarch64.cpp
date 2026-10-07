@@ -375,3 +375,23 @@ int JeandleAssembler::entry_barrier_stub_upper_bound() {
   // str + movptr + blr + ldr + b + guard word
   return 36;
 }
+
+int JeandleAssembler::exception_handler_upper_bound() {
+  // far_codestub_branch_size (6 instructions = 24 bytes)
+  return 24;
+}
+
+int JeandleAssembler::deopt_handler_upper_bound() {
+  // deopt_handler_size() = 7 * NativeInstruction::instruction_size = 28 bytes
+  return 28;
+}
+
+int JeandleAssembler::static_call_stub_upper_bound() {
+  // 13 * NativeInstruction::instruction_size = 52 bytes
+  return 52;
+}
+
+int JeandleAssembler::trampoline_call_stub_upper_bound() {
+  // max_trampoline_stub_size() = NativeInstruction::instruction_size + NativeCallTrampolineStub::instruction_size (32 bytes)
+  return 32;
+}

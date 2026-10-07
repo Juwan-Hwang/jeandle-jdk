@@ -354,3 +354,23 @@ int JeandleAssembler::entry_barrier_stub_upper_bound() {
   // call RuntimeAddress + jmp continuation
   return 24;
 }
+
+int JeandleAssembler::exception_handler_upper_bound() {
+  // start_a_stub(NativeJump::instruction_size), jmp RuntimeAddress (5 bytes, bounded by 8)
+  return 8;
+}
+
+int JeandleAssembler::deopt_handler_upper_bound() {
+  // deopt_handler_size() = 17 bytes, bounded by 24 (word-aligned)
+  return 24;
+}
+
+int JeandleAssembler::static_call_stub_upper_bound() {
+  // start_a_stub requested space for static call stub (28 bytes)
+  return 28;
+}
+
+int JeandleAssembler::trampoline_call_stub_upper_bound() {
+  // max_trampoline_stub_size() = NativeFarJump::instruction_size (13 bytes, bounded by 16)
+  return 16;
+}

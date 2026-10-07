@@ -310,8 +310,6 @@ void JeandleCompiledCode::finalize() {
     JEANDLE_REPORT_ERROR_AND_RET_VOID("shared stub overflow");
   }
 
-  finalize_telemetry.record();
-
   if (_entry_barrier_stub != nullptr) {
     _entry_barrier_stub->emit(masm);
   }
@@ -339,6 +337,21 @@ void JeandleCompiledCode::finalize() {
       RETURN_VOID_ON_JEANDLE_ERROR();
     }
   }
+
+  assert(!_used_exact_allocation || (size_t)_code_buffer.stubs()->size() <= layout.planned_stubs,
+         "stubs size %d must not exceed planned stubs payload %zu",
+         _code_buffer.stubs()->size(), layout.planned_stubs);
+
+  if (CodeBufferInstrumentation::enabled()) {
+    size_t actual_stubs = (size_t)_code_buffer.stubs()->size();
+    size_t saved_stubs = (LEGACY_STUBS_SIZE > layout.stubs_payload) ? (LEGACY_STUBS_SIZE - layout.stubs_payload) : 0;
+    tty->print_cr("[JeandleStubsPlan] method=%s planned_stubs=%zu actual_stubs=%zu legacy_stubs=%zu static_calls=%zu external_calls=%zu has_mh=%d saved_stubs=%zu",
+                  _func_name.c_str(), layout.planned_stubs, actual_stubs,
+                  LEGACY_STUBS_SIZE, layout.planned_static_calls, layout.planned_external_calls,
+                  layout.has_mh_invoke ? 1 : 0, saved_stubs);
+  }
+
+  finalize_telemetry.record();
 }
 
 void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler) {
@@ -578,6 +591,119 @@ size_t JeandleCompiledCode::post_insts_stubs_upper_bound() {
   return 0;
 }
 
+size_t JeandleCompiledCode::count_external_calls() {
+  if (_elf == nullptr) {
+    return 0;
+  }
+  auto ssp = std::make_shared<llvm::orc::SymbolStringPool>();
+  auto graph_or_err = llvm::jitlink::createLinkGraphFromObject(_elf->getMemoryBufferRef(), ssp);
+  if (!graph_or_err) {
+    return 0;
+  }
+  size_t count = 0;
+  auto link_graph = std::move(*graph_or_err);
+  for (auto *block : link_graph->blocks()) {
+    if (block->getSection().getName().compare(".text") == 0) {
+      for (auto& edge : block->edges()) {
+        auto& target = edge.getTarget();
+        if (JeandleAssembler::is_external_call_reloc(target, edge.getKind())) {
+          count++;
+        }
+      }
+    }
+  }
+  return count;
+}
+
+size_t JeandleCompiledCode::stubs_upper_bound(size_t& static_calls, size_t& external_calls, bool& has_mh) {
+  static_calls = 0;
+  external_calls = 0;
+  has_mh = _has_method_handle_invoke;
+  size_t unmapped_records = 0;
+
+  // Scan LLVM stackmaps to count physical call sites emitted by LLVM
+  SectionInfo section_info(".llvm_stackmaps");
+  if (_elf != nullptr && ReadELF::findSection(*_elf, section_info)) {
+    StackMapParser stackmaps(llvm::ArrayRef(((uint8_t*)object_start()) + section_info._offset, section_info._size));
+    for (auto record = stackmaps.records_begin(); record != stackmaps.records_end(); ++record) {
+      if (record->getID() < _non_routine_call_sites.size()) {
+        CallSiteInfo* call_info = _non_routine_call_sites[record->getID()];
+        if (call_info != nullptr) {
+          if (call_info->type() == JeandleCompiledCall::STATIC_CALL) {
+            static_calls++;
+          }
+          if (call_info->is_method_handle_invoke()) {
+            has_mh = true;
+          }
+        }
+      } else if (record->getID() != llvm::StatepointDirectives::DefaultStatepointID) {
+        // Guard against out-of-bounds statepoint IDs:
+        // Protects against non-surjective ID mapping under new LLVM passes or RISC-V lowering.
+        unmapped_records++;
+      }
+    }
+    if (unmapped_records > 0) {
+      // Conservative defensive guard: treat unmapped records as potential static calls.
+      static_calls += unmapped_records;
+    }
+  } else {
+    // Fallback: estimate from AST/bytecode call sites if stackmaps section is absent
+    for (const CallSiteInfo* call : _non_routine_call_sites) {
+      if (call != nullptr) {
+        if (call->type() == JeandleCompiledCall::STATIC_CALL) {
+          static_calls++;
+        }
+        if (call->is_method_handle_invoke()) {
+          has_mh = true;
+        }
+      }
+    }
+  }
+
+  if (!has_mh) {
+    for (const CallSiteInfo* call : _non_routine_call_sites) {
+      if (call != nullptr && call->is_method_handle_invoke()) {
+        has_mh = true;
+        break;
+      }
+    }
+  }
+
+  // Count external call relocations requiring far/trampoline stubs
+  external_calls = count_external_calls();
+
+  // If this is a non-method compilation (_method == nullptr), protect against under-reservation
+  if (_method == nullptr) {
+    size_t unmodeled = (size_t)LEGACY_STUBS_SIZE;
+    size_t computed = static_calls * (size_t)JeandleAssembler::static_call_stub_upper_bound() +
+                      external_calls * (size_t)JeandleAssembler::trampoline_call_stub_upper_bound();
+    return align_up(MAX2(unmodeled, computed), (size_t)CodeEntryAlignment);
+  }
+
+  size_t total = 0;
+  total += (size_t)JeandleAssembler::exception_handler_upper_bound();
+  total += (size_t)JeandleAssembler::deopt_handler_upper_bound();
+  if (has_mh) {
+    total += (size_t)JeandleAssembler::deopt_handler_upper_bound();
+  }
+
+  total += static_calls * (size_t)JeandleAssembler::static_call_stub_upper_bound();
+  total += external_calls * (size_t)JeandleAssembler::trampoline_call_stub_upper_bound();
+
+  if (unmapped_records > 0) {
+    total = MAX2(total, (size_t)LEGACY_STUBS_SIZE);
+    if (JeandleCodeBufferInstrument) {
+      tty->print_cr("[JeandleStubsPlan] Warning: method=%s has %zu unmapped stackmap records, applied legacy fallback",
+                    _func_name.c_str(), unmapped_records);
+    }
+  }
+
+  if (total > 0) {
+    total = align_up(total, (size_t)CodeEntryAlignment);
+  }
+  return total;
+}
+
 // Everything allocation-relevant therefore has to be decided here, up front.
 void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
                                                 uint64_t func_align,
@@ -586,6 +712,7 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
   // out early, and so the legacy path stays bit-for-bit identical.
   layout.planned_prolog       = INSTS_PROLOG_RESERVE;
   layout.planned_post_stubs   = 0;
+  layout.planned_stubs        = LEGACY_STUBS_SIZE;
   layout.insts_payload        = (size_t)elf_text_size + INSTS_PROLOG_RESERVE;
   layout.stubs_payload        = LEGACY_STUBS_SIZE;
   layout.locs_payload         = sizeof(relocInfo) + relocInfo::length_limit;
@@ -627,6 +754,7 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
     ConstLayoutStats::record_legacy(layout.consts_payload);
     _plan_status = layout.plan_status;
     _planned_consts_size = -1;
+    _planned_stubs_size = -1;
     _used_exact_allocation = false;
 
     if (CodeBufferInstrumentation::enabled()) {
@@ -660,6 +788,18 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
     layout.planned_prolog = exact_prolog;
     layout.planned_post_stubs = exact_post_stubs;
     layout.insts_payload = (size_t)elf_text_size + exact_prolog + exact_post_stubs;
+
+    // Week 8: Tightened stubs capacity model using exact mathematical upper bound
+    size_t static_calls = 0;
+    size_t external_calls = 0;
+    bool has_mh = false;
+    size_t exact_stubs = stubs_upper_bound(static_calls, external_calls, has_mh);
+    layout.planned_stubs = exact_stubs;
+    layout.stubs_payload = exact_stubs;
+    layout.planned_static_calls = static_calls;
+    layout.planned_external_calls = external_calls;
+    layout.has_mh_invoke = has_mh;
+    _planned_stubs_size = (int64_t)exact_stubs;
 
     ConstLayoutStats::record_exact(layout.consts_payload);
 

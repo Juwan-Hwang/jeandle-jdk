@@ -106,6 +106,12 @@ class JeandleAssembler : public StackObj {
   static int nmethod_entry_barrier_upper_bound();
   static int entry_barrier_stub_upper_bound();
 
+  // Week 8: Upper bounds for stubs section components (in bytes).
+  static int exception_handler_upper_bound();
+  static int deopt_handler_upper_bound();
+  static int static_call_stub_upper_bound();
+  static int trampoline_call_stub_upper_bound();
+
  private:
   MacroAssembler* _masm;
 
