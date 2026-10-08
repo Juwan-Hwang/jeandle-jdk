@@ -200,10 +200,17 @@ void CodeBuffer::initialize_section_size(CodeSection* cs, csize_t size) {
   // give it some relocations to start with, if the main section has them
   if (_insts.has_locs()) {
     // Secondary sections used to be handed exactly one record slot, which initialize_locs
-    // then floored to four - enough for one relocation and nothing more, so every section
-    // that carried a second record reallocated the array. A compiler that knows how many
-    // records it will emit can ask for that many up front.
-    cs->initialize_locs(_locs_capacity[cs->index()]);
+    // floored to four (the insts section gets eight). relocate() demands relocInfo::length_
+    // limit (15) free slots before it writes anything, so 4 or 8 < 15 meant the FIRST record
+    // already reallocated the array - the Week 9 census measured 9,127 of 9,205 compilations
+    // reallocating at least once. A compiler that knows how many records it will emit can ask
+    // for that many up front.
+    // The request array is in BYTES (see set_locs_capacity); initialize_locs() takes
+    // ELEMENTS - it allocates NEW_RESOURCE_ARRAY(relocInfo, n) and sets
+    // _locs_limit = _locs_start + n. The insts path in CodeBuffer::initialize()
+    // divides for exactly that reason; without the same division here the secondary
+    // sections were handed twice the relocation array the record model asked for.
+    cs->initialize_locs(_locs_capacity[cs->index()] / sizeof(relocInfo));
   }
 }
 

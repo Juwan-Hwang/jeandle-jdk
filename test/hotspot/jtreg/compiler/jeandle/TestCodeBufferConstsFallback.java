@@ -106,6 +106,14 @@ public class TestCodeBufferConstsFallback {
 
     private static long instrumentationLong(String stdout, String before, String after) {
         for (String line : stdout.split("\\R")) {
+            if (!line.contains("Consts:")) {
+                // Only the "Consts: usage N bytes / capacity N bytes, waste X%" line
+                // is meant here. Since Week 9 the summary also prints a
+                // "Locs elements: used N / capacity N" line that reuses the
+                // "/ capacity" token; without this anchor the lookup would match it
+                // and fail with "malformed consts line".
+                continue;
+            }
             int idx = line.indexOf(before);
             if (idx >= 0) {
                 String rest = line.substring(idx + before.length());
