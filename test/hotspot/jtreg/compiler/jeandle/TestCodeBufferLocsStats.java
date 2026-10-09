@@ -33,7 +33,7 @@ import java.util.regex.Pattern;
 
 /**
  * @test
- * @bug 8345679
+ * @comment Jeandle CodeBuffer exact-capacity feature work, not a JBS bug fix; no issue id applies.
  * @summary Verify Jeandle's exact locs (relocation array) sizing: the record model must
  *          cover every relocation actually written, and the arrays it sizes must never be
  *          reallocated while a compilation installs.

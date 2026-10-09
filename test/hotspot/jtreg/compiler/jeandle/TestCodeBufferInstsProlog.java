@@ -28,7 +28,7 @@ import java.util.regex.Pattern;
 
 /**
  * @test
- * @bug 8345678
+ * @comment Jeandle CodeBuffer exact-capacity feature work, not a JBS bug fix; no issue id applies.
  * @summary Verify Jeandle exact instruction section (insts) capacity modeling and prolog upper bound
  * @library /test/lib
  * @requires vm.compiler2.enabled
