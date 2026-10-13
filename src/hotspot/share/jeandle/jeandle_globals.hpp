@@ -99,6 +99,14 @@
           "Force the const section planner to fail so that the legacy "     \
           "6144*wordSize consts reservation is exercised (testing only).")  \
                                                                             \
+  product(bool, JeandleExactInsts, true,                                    \
+          "Size CodeBuffer insts section from exact prolog and machine "    \
+          "code upper bound instead of legacy 2048-byte prolog reserve.")   \
+                                                                            \
+  product(bool, JeandleExactStubs, true,                                    \
+          "Size CodeBuffer stubs section from exact stackmap and LinkGraph "\
+          "call site model instead of legacy fixed stubs reserve.")         \
+                                                                            \
   product(bool, JeandleExactLocs, true,                                     \
           "Size each CodeBuffer relocation array (locs) from the Jeandle "  \
           "relocation record model instead of HotSpot's fixed heuristic. "  \

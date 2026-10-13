@@ -216,6 +216,10 @@ void JeandleCompiledCode::finalize() {
   bool found = ReadELF::findFunc(*_elf, _func_name, align, offset, code_size);
   JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(found, "compiled function is not found in the ELF file");
 
+  // Force func_align to at least 4 bytes on RISC-V so the prolog upper bound and
+  // the blob start alignment match, preventing statepoint return PC misalignment (#634/#645).
+  RISCV_ONLY(align = MAX2(align, static_cast<uint64_t>(NativeInstruction::instruction_size));)
+
   setup_frame_size();
   RETURN_VOID_ON_JEANDLE_ERROR();
   assert(_frame_size > 0, "frame size must be positive");
@@ -291,9 +295,16 @@ void JeandleCompiledCode::finalize() {
   }
 
   assert(align > 1, "invalid alignment");
+  // ELF section alignment can be 2, and with UseRVC the HotSpot prolog above
+  // can end 2 (mod 4). Force the copied blob onto a 4-byte boundary so every
+  // statepoint return PC stays aligned for the jal patch. _prolog_length is
+  // taken after this align so stackmap fixups still point at the blob.
+  RISCV_ONLY(align = MAX2(align, static_cast<uint64_t>(NativeInstruction::instruction_size));)
   masm->align(static_cast<int>(align));
 
   _prolog_length = masm->offset();
+  RISCV_ONLY(assert(is_aligned(_prolog_length, NativeInstruction::instruction_size),
+                    "Jeandle blob start must be 4-byte aligned for call patching: %d", _prolog_length);)
 
   assert(!_used_exact_allocation || (size_t)_prolog_length <= layout.planned_prolog,
          "prolog length %d must not exceed planned upper bound %zu", _prolog_length, layout.planned_prolog);
@@ -1041,26 +1052,41 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
     _planned_alignment     = layout.planned_alignment;
     _planned_entries       = layout.planned_entries;
     _plan_status           = layout.plan_status;
-    _used_exact_allocation = true;
+    _used_exact_allocation = plan_ok && JeandleExactInsts && JeandleExactStubs;
 
-    // Week 7: Tightened insts capacity model using exact mathematical upper bound
-    size_t exact_prolog = prolog_upper_bound(func_align);
-    size_t exact_post_stubs = post_insts_stubs_upper_bound();
-    layout.planned_prolog = exact_prolog;
-    layout.planned_post_stubs = exact_post_stubs;
-    layout.insts_payload = (size_t)elf_text_size + exact_prolog + exact_post_stubs;
+    // Week 7 & 10: Tightened insts capacity model using exact mathematical upper bound
+    if (JeandleExactInsts) {
+      size_t exact_prolog = prolog_upper_bound(func_align);
+      size_t exact_post_stubs = post_insts_stubs_upper_bound();
+      layout.planned_prolog = exact_prolog;
+      layout.planned_post_stubs = exact_post_stubs;
+      layout.insts_payload = (size_t)elf_text_size + exact_prolog + exact_post_stubs;
+    } else {
+      layout.planned_prolog = INSTS_PROLOG_RESERVE;
+      layout.planned_post_stubs = 0;
+      layout.insts_payload = (size_t)elf_text_size + INSTS_PROLOG_RESERVE;
+    }
 
-    // Week 8: Tightened stubs capacity model using exact mathematical upper bound
-    size_t static_calls = 0;
-    size_t external_calls = 0;
-    bool has_mh = false;
-    size_t exact_stubs = stubs_upper_bound(census, static_calls, external_calls, has_mh);
-    layout.planned_stubs = exact_stubs;
-    layout.stubs_payload = exact_stubs;
-    layout.planned_static_calls = static_calls;
-    layout.planned_external_calls = external_calls;
-    layout.has_mh_invoke = has_mh;
-    _planned_stubs_size = (int64_t)exact_stubs;
+    // Week 8 & 10: Tightened stubs capacity model using exact mathematical upper bound
+    if (JeandleExactStubs) {
+      size_t static_calls = 0;
+      size_t external_calls = 0;
+      bool has_mh = false;
+      size_t exact_stubs = stubs_upper_bound(census, static_calls, external_calls, has_mh);
+      layout.planned_stubs = exact_stubs;
+      layout.stubs_payload = exact_stubs;
+      layout.planned_static_calls = static_calls;
+      layout.planned_external_calls = external_calls;
+      layout.has_mh_invoke = has_mh;
+      _planned_stubs_size = (int64_t)exact_stubs;
+    } else {
+      layout.planned_stubs = LEGACY_STUBS_SIZE;
+      layout.stubs_payload = LEGACY_STUBS_SIZE;
+      layout.planned_static_calls = 0;
+      layout.planned_external_calls = 0;
+      layout.has_mh_invoke = false;
+      _planned_stubs_size = (int64_t)LEGACY_STUBS_SIZE;
+    }
 
     // Week 9: Tightened locs capacity model from the relocation record census. It has to
     // run after insts and stubs are known, because the record gaps it has to budget for are
