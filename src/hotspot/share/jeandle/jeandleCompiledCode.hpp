@@ -513,7 +513,10 @@ class JeandleCompiledCode : public StackObj {
 
   void setup_frame_size();
 
-  void resolve_reloc_info(JeandleAssembler& assembler);
+  // The LinkGraph is built once in finalize() and shared between the relocation
+  // census (sizing) and the resolver, instead of being constructed twice from the
+  // same immutable ELF object. Planning-overhead optimization.
+  void resolve_reloc_info(JeandleAssembler& assembler, llvm::jitlink::LinkGraph* link_graph);
   bool pd_resolve_reloc(JeandleAssembler& assembler,
                         llvm::SmallVector<JeandleReloc*>& relocs,
                         llvm::jitlink::LinkGraph* link_graph);
@@ -528,7 +531,11 @@ class JeandleCompiledCode : public StackObj {
   // Week 5 & 7: decide every allocation-relevant quantity before any section size
   // has been requested from the CodeBuffer. See the .cpp for why this has to
   // happen before initialize().
-  void decide_install_layout(uint64_t elf_text_size, uint64_t func_align, InstallLayoutCore& layout);
+  // `link_graph` is the object's LinkGraph built once by finalize() and reused
+  // here (read-only census) and by resolve_reloc_info(). May be null, in which
+  // case the census refuses and the layout falls back to legacy.
+  void decide_install_layout(uint64_t elf_text_size, uint64_t func_align, InstallLayoutCore& layout,
+                             llvm::jitlink::LinkGraph* link_graph);
 
   // Week 7: exact upper bound estimators for insts section
   size_t prolog_upper_bound(uint64_t func_align);
@@ -542,7 +549,7 @@ class JeandleCompiledCode : public StackObj {
   // both reservations. Fills `census` exactly the way resolve_reloc_info() will later
   // resolve the same edges and records; returns false when the object cannot be inspected
   // at all, which puts the whole layout decision on the legacy path.
-  bool collect_call_site_census(JeandleCallSiteCensus& census);
+  bool collect_call_site_census(JeandleCallSiteCensus& census, llvm::jitlink::LinkGraph* link_graph);
 
   // Week 9: exact upper bound estimator for the locs section of each CodeBuffer section.
   void plan_locs_capacity(const JeandleCallSiteCensus& census,

@@ -227,8 +227,22 @@ void JeandleCompiledCode::finalize() {
   // Week 5 (F4): decide the whole allocation strategy here, while the CodeBuffer
   // still has no section sizes. Nothing below may change consts capacity or
   // consts alignment again.
+  //
+  // Planning-overhead optimization: build the object's LinkGraph exactly ONCE and
+  // share it between the relocation census (for sizing) and resolve_reloc_info().
+  // Previously both call sites ran createLinkGraphFromObject() on the same immutable
+  // ELF buffer, so one full graph construction per compilation was pure redundant work.
+  // A null graph (build failure) makes the census refuse -> legacy sizing, and
+  // resolve_reloc_info() then reports the error, matching the prior behavior where
+  // resolution always required the graph.
+  auto shared_ssp = std::make_shared<llvm::orc::SymbolStringPool>();
+  auto shared_graph_or_err = llvm::jitlink::createLinkGraphFromObject(_elf->getMemoryBufferRef(), shared_ssp);
+  std::unique_ptr<llvm::jitlink::LinkGraph> shared_link_graph =
+      shared_graph_or_err ? std::move(*shared_graph_or_err) : nullptr;
+  llvm::jitlink::LinkGraph* link_graph = shared_link_graph.get();
+
   InstallLayoutCore layout;
-  decide_install_layout(code_size, align, layout);
+  decide_install_layout(code_size, align, layout, link_graph);
   // From here on the telemetry guard reports the plan that was actually used.
   finalize_telemetry.set_layout(&layout);
 
@@ -322,7 +336,7 @@ void JeandleCompiledCode::finalize() {
   // Week 4: Emit planned const sections in canonical order before resolving relocations
   emit_planned_const_sections(assembler);
 
-  resolve_reloc_info(assembler);
+  resolve_reloc_info(assembler, link_graph);
   RETURN_VOID_ON_JEANDLE_ERROR();
 
   // generate shared trampoline stubs
@@ -374,18 +388,14 @@ void JeandleCompiledCode::finalize() {
   finalize_telemetry.record();
 }
 
-void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler) {
+void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler, llvm::jitlink::LinkGraph* link_graph) {
   llvm::SmallVector<JeandleReloc*> relocs;
 
-  // Step 1: Resolve LinkGraph.
-  auto ssp = std::make_shared<llvm::orc::SymbolStringPool>();
+  // Step 1: Use the LinkGraph built once in finalize() and shared with the census
+  // (planning-overhead optimization: no second createLinkGraphFromObject here).
+  JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(link_graph != nullptr, "failed to create LinkGraph");
 
-  auto graph_or_err = llvm::jitlink::createLinkGraphFromObject(_elf->getMemoryBufferRef(), ssp);
-  JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(graph_or_err, "failed to create LinkGraph");
-
-  auto link_graph = std::move(*graph_or_err);
-
-  if (!pd_resolve_reloc(assembler, relocs, link_graph.get())) {
+  if (!pd_resolve_reloc(assembler, relocs, link_graph)) {
     for (auto *block : link_graph->blocks()) {
       // Resolve relocations in the compiled code and constant pool.
       if (block->getSection().getName().compare(".text") != 0 &&
@@ -626,17 +636,14 @@ size_t JeandleCompiledCode::post_insts_stubs_upper_bound() {
 // Week 8 had a smaller version of this walk, count_external_calls(), which built its own
 // LinkGraph only to ask one question of it. That graph build is now part of this pass, so
 // the function is gone rather than moved.
-bool JeandleCompiledCode::collect_call_site_census(JeandleCallSiteCensus& census) {
-  if (_elf == nullptr) {
+bool JeandleCompiledCode::collect_call_site_census(JeandleCallSiteCensus& census,
+                                                   llvm::jitlink::LinkGraph* link_graph) {
+  if (_elf == nullptr || link_graph == nullptr) {
     return false;
   }
 
-  auto ssp = std::make_shared<llvm::orc::SymbolStringPool>();
-  auto graph_or_err = llvm::jitlink::createLinkGraphFromObject(_elf->getMemoryBufferRef(), ssp);
-  if (!graph_or_err) {
-    return false;
-  }
-  auto link_graph = std::move(*graph_or_err);
+  // The LinkGraph is provided by finalize() and shared with resolve_reloc_info();
+  // it is no longer constructed here (planning-overhead optimization).
 
   // Edge census. RISC-V classifies its edges through pd_resolve_reloc(), which pairs every
   // R_RISCV_PCREL_LO12_I edge with the HI20 edge it refers to before deciding what the
@@ -644,7 +651,7 @@ bool JeandleCompiledCode::collect_call_site_census(JeandleCallSiteCensus& census
   // live next to the two resolvers and are selected the same way resolve_reloc_info()
   // selects them, so a drift between resolver and census is a compile-time mismatch, not
   // an under-provisioned array.
-  if (!pd_collect_call_site_census(link_graph.get(), census)) {
+  if (!pd_collect_call_site_census(link_graph, census)) {
     for (auto* block : link_graph->blocks()) {
       const llvm::StringRef block_name = block->getSection().getName();
       if (block_name.compare(".text") != 0 &&
@@ -973,7 +980,8 @@ void JeandleCompiledCode::plan_locs_capacity(const JeandleCallSiteCensus& census
 // Everything allocation-relevant therefore has to be decided here, up front.
 void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
                                                 uint64_t func_align,
-                                                InstallLayoutCore& layout) {
+                                                InstallLayoutCore& layout,
+                                                llvm::jitlink::LinkGraph* link_graph) {
   // Start from the pre-Week-5 values so every field is defined even if we bail
   // out early, and so the legacy path stays bit-for-bit identical.
   layout.planned_prolog       = INSTS_PROLOG_RESERVE;
@@ -992,7 +1000,7 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
   // the locs reservation below. Computed even when the const planner later refuses, because
   // a refused consts plan must not cost the stubs plan its input.
   JeandleCallSiteCensus census;
-  const bool census_ok = collect_call_site_census(census);
+  const bool census_ok = collect_call_site_census(census, link_graph);
 
   // W6 base-alignment safety fix: the planner's F1 guard only protects us when the value it is given really is
   // the alignment of the consts base. BufferBlob memory is only word-aligned, and a
