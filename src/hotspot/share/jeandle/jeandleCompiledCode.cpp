@@ -999,8 +999,16 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
   // Week 9: one walk over the object's edges and stackmap records, shared by the stubs and
   // the locs reservation below. Computed even when the const planner later refuses, because
   // a refused consts plan must not cost the stubs plan its input.
+  //
+  // Planning-overhead optimization (lazy census): the census is consumed only by the exact
+  // stubs model (stubs_upper_bound) and the exact locs model (plan_locs_capacity). When
+  // both are disabled there is no consumer, so the edge + stackmap traversal is pure waste;
+  // skip it. Leaving `census` zeroed and census_ok=false reproduces the pre-existing legacy
+  // sizing exactly (stubs -> LEGACY_STUBS_SIZE, locs -> LEGACY_LOCS_SIZE), so this cannot
+  // under- or over-provision. When either model is enabled, the census runs as before.
   JeandleCallSiteCensus census;
-  const bool census_ok = collect_call_site_census(census, link_graph);
+  const bool census_needed = JeandleExactStubs || JeandleExactLocs;
+  const bool census_ok = census_needed ? collect_call_site_census(census, link_graph) : false;
 
   // W6 base-alignment safety fix: the planner's F1 guard only protects us when the value it is given really is
   // the alignment of the consts base. BufferBlob memory is only word-aligned, and a
