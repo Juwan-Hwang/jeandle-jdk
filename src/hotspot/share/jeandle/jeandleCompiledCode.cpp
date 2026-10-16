@@ -163,10 +163,45 @@ void JeandleCompiledCode::install_obj(std::unique_ptr<ObjectBuffer> obj) {
   int func_count = 0;
   for (const llvm::object::ELFSymbolRef &sym : _elf->symbols()) {
     llvm::Expected<llvm::object::SymbolRef::Type> type = sym.getType();
-    if (!type || (*type) != llvm::object::SymbolRef::Type::ST_Function) {
+    if (!type) {
+      llvm::consumeError(type.takeError());
+      continue;
+    }
+    if (*type != llvm::object::SymbolRef::Type::ST_Function) {
       continue;
     }
     func_count++;
+    bool symbol_ok = true;
+    llvm::Expected<llvm::StringRef> sym_name = sym.getName();
+    if (sym_name) {
+      _func_symbol_name_matches = sym_name->compare(_func_name) == 0;
+    } else {
+      llvm::consumeError(sym_name.takeError());
+      symbol_ok = false;
+    }
+    llvm::Expected<llvm::object::section_iterator> section = sym.getSection();
+    if (section) {
+      _func_symbol_align = (*section)->getAlignment().value();
+      llvm::Expected<uint64_t> sym_value = sym.getValue();
+      if (sym_value) {
+        _func_symbol_offset =
+            _elf->getSection((*section)->getRawDataRefImpl())->sh_offset + *sym_value;
+      } else {
+        llvm::consumeError(sym_value.takeError());
+        symbol_ok = false;
+      }
+    } else {
+      llvm::consumeError(section.takeError());
+      symbol_ok = false;
+    }
+    llvm::Expected<uint64_t> sym_size = sym.getSize();
+    if (sym_size) {
+      _func_symbol_code_size = *sym_size;
+    } else {
+      llvm::consumeError(sym_size.takeError());
+      symbol_ok = false;
+    }
+    _func_symbol_found = symbol_ok;
   }
   JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(func_count == 1,
     "expected exactly one compiled function in ELF, but found multiple");
@@ -213,7 +248,14 @@ void JeandleCompiledCode::finalize() {
   uint64_t align;
   uint64_t offset;
   uint64_t code_size;
-  bool found = ReadELF::findFunc(*_elf, _func_name, align, offset, code_size);
+  bool found = _func_symbol_found && _func_symbol_name_matches;
+  if (found) {
+    align = _func_symbol_align;
+    offset = _func_symbol_offset;
+    code_size = _func_symbol_code_size;
+  } else {
+    found = ReadELF::findFunc(*_elf, _func_name, align, offset, code_size);
+  }
   JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(found, "compiled function is not found in the ELF file");
 
   // Force func_align to at least 4 bytes on RISC-V so the prolog upper bound and
@@ -240,6 +282,10 @@ void JeandleCompiledCode::finalize() {
     JEANDLE_REPORT_ERROR_AND_RET_VOID("CodeCache is full");
   }
   _code_buffer.initialize_consts_size(layout.consts_payload);
+  guarantee(_const_plan.status() != ConstPlanStatus::Ok ||
+            is_aligned(_code_buffer.consts()->start(), _const_plan.max_alignment()),
+            "consts base " PTR_FORMAT " not aligned to %d", p2i(_code_buffer.consts()->start()),
+            (int)_const_plan.max_alignment());
 
   if (CodeBufferInstrumentation::enabled()) {
     CodeBufferInstrumentation::instance()->record_initialize(
@@ -378,14 +424,10 @@ void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler) {
   llvm::SmallVector<JeandleReloc*> relocs;
 
   // Step 1: Resolve LinkGraph.
-  auto ssp = std::make_shared<llvm::orc::SymbolStringPool>();
+  llvm::jitlink::LinkGraph* link_graph = shared_link_graph();
+  JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(link_graph != nullptr, "failed to create LinkGraph");
 
-  auto graph_or_err = llvm::jitlink::createLinkGraphFromObject(_elf->getMemoryBufferRef(), ssp);
-  JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(graph_or_err, "failed to create LinkGraph");
-
-  auto link_graph = std::move(*graph_or_err);
-
-  if (!pd_resolve_reloc(assembler, relocs, link_graph.get())) {
+  if (!pd_resolve_reloc(assembler, relocs, link_graph)) {
     for (auto *block : link_graph->blocks()) {
       // Resolve relocations in the compiled code and constant pool.
       if (block->getSection().getName().compare(".text") != 0 &&
@@ -468,7 +510,7 @@ void JeandleCompiledCode::resolve_reloc_info(JeandleAssembler& assembler) {
 
   // Step 2: Resolve stackmaps.
   SectionInfo section_info(".llvm_stackmaps");
-  if (ReadELF::findSection(*_elf, section_info)) {
+  if (find_section_cached(".llvm_stackmaps", section_info)) {
     StackMapParser stackmaps(llvm::ArrayRef(((uint8_t*)object_start()) + section_info._offset, section_info._size));
     for (auto record = stackmaps.records_begin(); record != stackmaps.records_end(); ++record) {
       assert(_prolog_length != -1, "prolog length must be initialized");
@@ -612,6 +654,61 @@ size_t JeandleCompiledCode::post_insts_stubs_upper_bound() {
 }
 
 // ---------------------------------------------------------------------------
+// Week 11/12: one LinkGraph per compilation & section cache
+// ---------------------------------------------------------------------------
+llvm::jitlink::LinkGraph* JeandleCompiledCode::shared_link_graph() {
+  if (_link_graph != nullptr) {
+    return _link_graph.get();
+  }
+  if (_elf == nullptr) {
+    return nullptr;
+  }
+  if (!_link_graph_ssp) {
+    _link_graph_ssp = std::make_shared<llvm::orc::SymbolStringPool>();
+  }
+  auto graph_or_err = llvm::jitlink::createLinkGraphFromObject(_elf->getMemoryBufferRef(), _link_graph_ssp);
+  if (!graph_or_err) {
+    llvm::consumeError(graph_or_err.takeError());
+    return nullptr;
+  }
+  _link_graph = std::move(*graph_or_err);
+  return _link_graph.get();
+}
+
+bool JeandleCompiledCode::find_section_cached(llvm::StringRef name, SectionInfo& section_info) {
+  if (!_section_cache_built) {
+    if (_elf == nullptr) {
+      return false;
+    }
+    for (auto sec = _elf->section_begin(); sec != _elf->section_end(); ++sec) {
+      llvm::Expected<llvm::StringRef> cur_name = sec->getName();
+      if (!cur_name) {
+        llvm::consumeError(cur_name.takeError());
+        continue;
+      }
+      if (llvm::any_of(_section_cache, [&](const SectionInfo& info) {
+            return info._name == *cur_name;
+          })) {
+        continue;
+      }
+      SectionInfo info(*cur_name);
+      info._offset = _elf->getSection(sec->getRawDataRefImpl())->sh_offset;
+      info._size = sec->getSize();
+      info._alignment = sec->getAlignment().value();
+      _section_cache.push_back(info);
+    }
+    _section_cache_built = true;
+  }
+  for (const SectionInfo& info : _section_cache) {
+    if (info._name == name) {
+      section_info = info;
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Week 9: one census, two reservations
 // ---------------------------------------------------------------------------
 //
@@ -631,12 +728,10 @@ bool JeandleCompiledCode::collect_call_site_census(JeandleCallSiteCensus& census
     return false;
   }
 
-  auto ssp = std::make_shared<llvm::orc::SymbolStringPool>();
-  auto graph_or_err = llvm::jitlink::createLinkGraphFromObject(_elf->getMemoryBufferRef(), ssp);
-  if (!graph_or_err) {
+  llvm::jitlink::LinkGraph* link_graph = shared_link_graph();
+  if (link_graph == nullptr) {
     return false;
   }
-  auto link_graph = std::move(*graph_or_err);
 
   // Edge census. RISC-V classifies its edges through pd_resolve_reloc(), which pairs every
   // R_RISCV_PCREL_LO12_I edge with the HI20 edge it refers to before deciding what the
@@ -644,7 +739,7 @@ bool JeandleCompiledCode::collect_call_site_census(JeandleCallSiteCensus& census
   // live next to the two resolvers and are selected the same way resolve_reloc_info()
   // selects them, so a drift between resolver and census is a compile-time mismatch, not
   // an under-provisioned array.
-  if (!pd_collect_call_site_census(link_graph.get(), census)) {
+  if (!pd_collect_call_site_census(link_graph, census)) {
     for (auto* block : link_graph->blocks()) {
       const llvm::StringRef block_name = block->getSection().getName();
       if (block_name.compare(".text") != 0 &&
@@ -679,11 +774,50 @@ bool JeandleCompiledCode::collect_call_site_census(JeandleCallSiteCensus& census
     }
   }
 
+  // Distinct shared-trampoline targets on the LinkGraph path.
+  // Restricted to platforms that branch far (e.g. RISC-V): only there does
+  // trampoline_call() emit (and share) runtime trampolines.
+  const bool count_shared_targets = JeandleAssembler::needs_trampoline_branches() &&
+                                    JeandleAssembler::shares_runtime_call_trampolines();
+  if (count_shared_targets) {
+    llvm::SmallVector<llvm::StringRef, 8> tramp_names;
+    llvm::SmallVector<address, 8> routine_seen;
+    auto note_name = [&](llvm::StringRef n) {
+      if (std::find(tramp_names.begin(), tramp_names.end(), n) == tramp_names.end()) {
+        tramp_names.push_back(n);
+      }
+    };
+    for (auto* block : link_graph->blocks()) {
+      if (block->getSection().getName().compare(".text") != 0) {
+        continue;
+      }
+      for (auto& edge : block->edges()) {
+        auto& target = edge.getTarget();
+        if (!target.hasName()) {
+          continue;
+        }
+        const llvm::StringRef name = *(target.getName());
+        if (JeandleAssembler::is_routine_call_reloc(target, edge.getKind())) {
+          address entry = JeandleRuntimeRoutine::get_routine_entry(name);
+          if (std::find(routine_seen.begin(), routine_seen.end(), entry) == routine_seen.end()) {
+            routine_seen.push_back(entry);
+            if (JeandleAssembler::runtime_call_needs_trampoline(entry)) {
+              note_name(name);
+            }
+          }
+        } else if (JeandleAssembler::is_external_call_reloc(target, edge.getKind())) {
+          note_name(name);
+        }
+      }
+    }
+    census._shared_trampoline_targets = (int)tramp_names.size();
+  }
+
   // Stackmap records: one record per physically emitted statepoint call. This is the
   // Week 8 lesson - the bytecode-level count is not the machine-code count, because LLVM
   // unrolls loops, duplicates tail calls and inlines, and every copy gets its own record.
   SectionInfo section_info(".llvm_stackmaps");
-  if (ReadELF::findSection(*_elf, section_info)) {
+  if (find_section_cached(".llvm_stackmaps", section_info)) {
     StackMapParser stackmaps(llvm::ArrayRef(((uint8_t*)object_start()) + section_info._offset,
                                             section_info._size));
     for (auto record = stackmaps.records_begin(); record != stackmaps.records_end(); ++record) {
@@ -807,10 +941,17 @@ size_t JeandleCompiledCode::stubs_upper_bound(const JeandleCallSiteCensus& censu
   // small on RISC-V and AArch64. Routine calls share one trampoline per target, so this is
   // deliberately an over-estimate for them: the census counts callers, not targets.
   if (JeandleAssembler::needs_trampoline_branches()) {
-    const size_t trampolines = static_calls +
-                               (size_t)census._virtual_call_sites +
-                               (size_t)census._routine_call_sites +
-                               external_calls;
+    size_t trampolines;
+    if (census._shared_trampoline_targets >= 0 && JeandleAssembler::shares_runtime_call_trampolines()) {
+      trampolines = static_calls +
+                    (size_t)census._virtual_call_sites +
+                    (size_t)census._shared_trampoline_targets;
+    } else {
+      trampolines = static_calls +
+                    (size_t)census._virtual_call_sites +
+                    (size_t)census._routine_call_sites +
+                    external_calls;
+    }
     total += trampolines * (size_t)JeandleAssembler::trampoline_call_stub_upper_bound();
   }
 
@@ -989,23 +1130,26 @@ void JeandleCompiledCode::decide_install_layout(uint64_t elf_text_size,
   ConstLayoutStats::record_method();
 
   // Week 9: one walk over the object's edges and stackmap records, shared by the stubs and
-  // the locs reservation below. Computed even when the const planner later refuses, because
-  // a refused consts plan must not cost the stubs plan its input.
+  // the locs reservation below. Computed only when stubs or locs exact planning is active.
   JeandleCallSiteCensus census;
-  const bool census_ok = collect_call_site_census(census);
+  bool census_ok = false;
+  if (JeandleExactStubs || JeandleExactLocs) {
+    census_ok = collect_call_site_census(census);
+  }
 
-  // W6 base-alignment safety fix: the planner's F1 guard only protects us when the value it is given really is
-  // the alignment of the consts base. BufferBlob memory is only word-aligned, and a
-  // temporary probe measured the base at 8 mod 16 for 47/78 methods on x86_64 and
-  // 51/115 on aarch64 - while CodeEntryAlignment is 32/64 there, so passing it made the
-  // guard unable to fire for a 16-byte constant. aarch64 then dies on its relocation
-  // guarantee (relocInfo_aarch64.cpp:130); x86 has no such check and emits the
-  // misalignment silently. Trust only what allocation guarantees until the layout is
-  // made absolute (P1). Evidence: artifacts/w6_consts_base_alignment.txt.
-  // Not constexpr: CodeEntryAlignment is a runtime flag, so its value is not usable in
-  // a constant expression (this was caught by the compiler, not by reading).
+  // Consts base alignment the planner may assume (Week 11/12).
+  //
+  // W6 capped this at HeapWordSize because a probe found the consts base at 8 mod 16.
+  // Since Week 5/F1 + Week 10/P1 the order is: plan -> set_const_section_alignment(max) ->
+  // blob sizing -> initialize_consts_size(). Both places the constants ever live then honour
+  // the plan's maximum alignment A in ABSOLUTE terms:
+  //  * in the CodeBuffer: initialize_section_size() aligns the consts start address itself down to A;
+  //  * in the nmethod: compute_final_layout() puts consts first, at offset 0 of the content,
+  //    and the content begins at a CodeEntryAlignment boundary of a CodeCacheSegmentSize-aligned heap block.
+  // So the guarantee is min(MAX_SUPPORTED_CONST_ALIGNMENT, CodeEntryAlignment, CodeCacheSegmentSize).
   const uint64_t guaranteed_base_align =
-      MIN2((uint64_t)CodeEntryAlignment, (uint64_t)HeapWordSize);
+      MIN3(ConstSectionPlan::MAX_SUPPORTED_CONST_ALIGNMENT, (uint64_t)CodeEntryAlignment,
+           (uint64_t)CodeCacheSegmentSize);
   bool plan_ok = ReadELF::build_const_section_plan(*_elf, _const_plan, guaranteed_base_align);
 
   // Diagnostic escape hatch. A real planner failure depends on the ELF
@@ -1419,7 +1563,7 @@ address JeandleCompiledCode::lookup_const_section_fallback(llvm::StringRef name,
   }
 
   SectionInfo section_info(name);
-  bool found = ReadELF::findSection(*_elf, section_info);
+  bool found = find_section_cached(name, section_info);
   JEANDLE_ERROR_ASSERT_AND_RET_ON_FAIL(found, "const section not found, bad ELF file", nullptr);
 
   address target_base = _code_buffer.consts()->end();
@@ -2129,7 +2273,7 @@ JeandleStackMap* JeandleCompiledCode::parse_stackmap(StackMapParser& stackmaps,
 
 void JeandleCompiledCode::build_exception_handler_table() {
   SectionInfo excpet_table_section(".gcc_except_table");
-  if (ReadELF::findSection(*_elf, excpet_table_section)) {
+  if (find_section_cached(".gcc_except_table", excpet_table_section)) {
     // Start of the exception handler table.
     const char* except_table_pointer = object_start() + excpet_table_section._offset;
 
@@ -2177,7 +2321,7 @@ void JeandleCompiledCode::build_exception_handler_table() {
 
 void JeandleCompiledCode::build_implicit_exception_table() {
   SectionInfo section_info(".llvm_faultmaps");
-  if (!ReadELF::findSection(*_elf, section_info)) {
+  if (!find_section_cached(".llvm_faultmaps", section_info)) {
       // No implicit exception table.
       return;
   }

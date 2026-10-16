@@ -474,6 +474,10 @@ bool JeandleAssembler::static_call_stub_has_runtime_call_record() {
 // `_rel_offset` that a R_RISCV_PCREL_LO12_I edge carries relative to its HI20 partner -
 // and such a pair contributes one record per edge, because
 // JeandleAssembler::is_section_word_reloc() accepts both halves of the pair.
+bool JeandleAssembler::runtime_call_needs_trampoline(address target) {
+  return true;
+}
+
 int JeandleAssembler::reloc_record_data_halfwords(relocInfo::relocType type) {
   switch (type) {
     case relocInfo::jeandle_oop_type:

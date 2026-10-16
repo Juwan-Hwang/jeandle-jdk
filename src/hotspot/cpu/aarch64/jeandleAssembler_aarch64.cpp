@@ -434,6 +434,10 @@ bool JeandleAssembler::static_call_stub_has_runtime_call_record() {
 // As on x86_64, relocInfo_aarch64.cpp's pd_pack_data_to() returns false for all three
 // jeandle types, so their payload is written by the base classes - pack_2_ints_to(), at
 // most 4 halfwords per record.
+bool JeandleAssembler::runtime_call_needs_trampoline(address target) {
+  return true;
+}
+
 int JeandleAssembler::reloc_record_data_halfwords(relocInfo::relocType type) {
   switch (type) {
     case relocInfo::jeandle_oop_type:        // oop_Relocation: index + offset

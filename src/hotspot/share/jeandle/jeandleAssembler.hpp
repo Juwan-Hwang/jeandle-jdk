@@ -122,6 +122,7 @@ class JeandleAssembler : public StackObj {
   // routine calls share them. Both decide how many records the stubs section receives.
   static bool needs_trampoline_branches();
   static bool shares_runtime_call_trampolines();
+  static bool runtime_call_needs_trampoline(address target);
 
   // Week 9: whether the deferred nmethod entry barrier stub reaches its runtime routine
   // through a pc-relative call (which relocates) or by loading an address into a register

@@ -30,7 +30,7 @@
 // Get the frame size from .stack_sizes section.
 void JeandleCompiledCode::setup_frame_size() {
   SectionInfo section_info(".stack_sizes");
-  bool found = ReadELF::findSection(*_elf, section_info);
+  bool found = find_section_cached(".stack_sizes", section_info);
   JEANDLE_ERROR_ASSERT_AND_RET_VOID_ON_FAIL(found, ".stack_sizes section not found");
 
   llvm::DataExtractor data_extractor(llvm::StringRef(((char*)_obj->getBufferStart()) + section_info._offset, section_info._size),
@@ -44,7 +44,7 @@ void JeandleCompiledCode::setup_frame_size() {
 
 bool JeandleCompiledCode::pd_build_exception_handler_table() {
   SectionInfo excpet_table_section(".gcc_except_table");
-  if (ReadELF::findSection(*_elf, excpet_table_section)) {
+  if (find_section_cached(".gcc_except_table", excpet_table_section)) {
     // Start of the exception handler table.
     const char* except_table_pointer = object_start() + excpet_table_section._offset;
 

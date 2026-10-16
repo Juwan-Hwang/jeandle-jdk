@@ -209,13 +209,14 @@ struct JeandleCallSiteCensus {
   int _unmapped_records;
 
   bool _has_method_handle_invoke;
+  int _shared_trampoline_targets;
 
   JeandleCallSiteCensus()
     : _static_call_sites(0), _opt_virtual_call_sites(0), _virtual_call_sites(0),
       _routine_call_sites(0), _external_call_sites(0),
       _stub_c_call_sites(0), _section_word_insts(0), _section_word_consts(0),
       _oop_relocs(0), _oop_addr_relocs(0), _unclassified_edges(0), _unmapped_records(0),
-      _has_method_handle_invoke(false) {}
+      _has_method_handle_invoke(false), _shared_trampoline_targets(-1) {}
 
   int total_records() const {
     return _static_call_sites + _opt_virtual_call_sites + _virtual_call_sites +
@@ -297,6 +298,15 @@ class JeandleCompiledCode : public StackObj {
                       bool is_osr_entry) :
                       _obj(nullptr),
                       _elf(nullptr),
+                      _link_graph_ssp(nullptr),
+                      _link_graph(nullptr),
+                      _section_cache(),
+                      _section_cache_built(false),
+                      _func_symbol_found(false),
+                      _func_symbol_name_matches(false),
+                      _func_symbol_align(0),
+                      _func_symbol_offset(0),
+                      _func_symbol_code_size(0),
                       _code_buffer("JeandleCompiledCode"),
                       _routine_call_sites(),
                       _non_routine_call_sites(),
@@ -340,6 +350,15 @@ class JeandleCompiledCode : public StackObj {
   JeandleCompiledCode(ciEnv* env, const char* func_name) :
                       _obj(nullptr),
                       _elf(nullptr),
+                      _link_graph_ssp(nullptr),
+                      _link_graph(nullptr),
+                      _section_cache(),
+                      _section_cache_built(false),
+                      _func_symbol_found(false),
+                      _func_symbol_name_matches(false),
+                      _func_symbol_align(0),
+                      _func_symbol_offset(0),
+                      _func_symbol_code_size(0),
                       _code_buffer("JeandleCompiledStub"),
                       _routine_call_sites(),
                       _non_routine_call_sites(),
@@ -452,6 +471,20 @@ class JeandleCompiledCode : public StackObj {
  private:
   std::unique_ptr<ObjectBuffer> _obj; // Compiled instructions.
   std::unique_ptr<ELFObject> _elf;
+  std::shared_ptr<llvm::orc::SymbolStringPool> _link_graph_ssp;
+  std::unique_ptr<llvm::jitlink::LinkGraph> _link_graph;
+  llvm::SmallVector<SectionInfo, 32> _section_cache;
+  bool _section_cache_built;
+
+  bool _func_symbol_found;
+  bool _func_symbol_name_matches;
+  uint64_t _func_symbol_align;
+  uint64_t _func_symbol_offset;
+  uint64_t _func_symbol_code_size;
+
+  llvm::jitlink::LinkGraph* shared_link_graph();
+  bool find_section_cached(llvm::StringRef name, SectionInfo& section_info);
+
   CodeBuffer _code_buffer; // Relocations and stubs.
 
   // Call sites in our compiled code:
