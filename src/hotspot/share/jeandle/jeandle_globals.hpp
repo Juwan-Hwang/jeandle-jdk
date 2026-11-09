@@ -125,6 +125,11 @@
   develop(ccstr, JeandleTraceRelocMethod, nullptr,                          \
           "Function name of the method whose relocate() steps "             \
           "-XX:+JeandleTraceRelocSteps should follow.")                     \
+                                                                            \
+  develop(bool, JeandleStressCodeBufferExpand, false,                       \
+          "Start the stubs section of every Jeandle CodeBuffer empty so "   \
+          "that the first emitted stub expands the buffer (testing only).") \
+                                                                            \
                                                                             // end of JEANDLE_FLAGS
 
 DECLARE_FLAGS(JEANDLE_FLAGS)
